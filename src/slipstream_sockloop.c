@@ -355,15 +355,44 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
 }
 
 void* slipstream_packet_loop(picoquic_network_thread_ctx_t* thread_ctx) {
+    return slipstream_packet_loop_bound(thread_ctx, NULL);
+}
+
+/* Explicit server binding must happen on a fresh socket, before any wildcard bind. */
+static int open_bound_socket(const picoquic_packet_loop_param_t* param,
+    const struct sockaddr_in* address, picoquic_socket_ctx_t* ctx) {
+    int recv_set = 0, send_set = 0;
+    ctx->af = AF_INET;
+    ctx->port = ntohs(address->sin_port);
+    ctx->fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (ctx->fd == INVALID_SOCKET) return -1;
+    if (param->local_af != AF_INET || !param->do_not_use_gso ||
+        picoquic_socket_set_ecn_options(ctx->fd, AF_INET, &recv_set, &send_set) ||
+        picoquic_socket_set_pkt_info(ctx->fd, AF_INET) ||
+        bind(ctx->fd, (const struct sockaddr*)address, sizeof(*address)) ||
+        picoquic_socket_set_pmtud_options(ctx->fd, AF_INET) ||
+        (param->socket_buffer_size > 0 &&
+         (setsockopt(ctx->fd, SOL_SOCKET, SO_SNDBUF, &param->socket_buffer_size, sizeof(int)) ||
+          setsockopt(ctx->fd, SOL_SOCKET, SO_RCVBUF, &param->socket_buffer_size, sizeof(int))))) {
+        picoquic_packet_loop_close_socket(ctx);
+        return -1;
+    }
+    return 1;
+}
+
+void* slipstream_packet_loop_bound(picoquic_network_thread_ctx_t* thread_ctx,
+    const struct sockaddr_in* listen_address) {
     const picoquic_packet_loop_param_t* param = thread_ctx->param;
     if (!param->do_not_use_gso && param->encode != NULL && !param->is_client) {
         DBG_FATAL_PRINTF("%s", "GSO disabled because encoding is enabled and server mode");
     }
 
     picoquic_socket_ctx_t s_ctx = {0};
-    if (picoquic_packet_loop_open_sockets(param->local_port,
+    int opened = listen_address ? open_bound_socket(param, listen_address, &s_ctx) :
+        picoquic_packet_loop_open_sockets(param->local_port,
         param->local_af, param->socket_buffer_size,
-        0, param->do_not_use_gso, &s_ctx) <= 0) {
+        0, param->do_not_use_gso, &s_ctx);
+    if (opened <= 0) {
         thread_ctx->return_code = PICOQUIC_ERROR_UNEXPECTED_ERROR;
         return NULL;
     }

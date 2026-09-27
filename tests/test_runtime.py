@@ -255,6 +255,63 @@ class Parity(unittest.TestCase):
         self.assertFalse(b.errors)
         self.assertIsNone(server.poll())
 
+    def test_server_explicit_bind_and_read_only_reset_seed(self):
+        seed = pathlib.Path(self.tmp.name) / "reset-seed"
+        for contents in (b"0123456789abcdef" * 2 + b"\n",
+                         b"0123456789ABCDEF" * 2,
+                         b" \t" + b"0123456789abcdef" * 2 + b"\r\n"):
+            with self.subTest(format_length=len(contents)):
+                seed.write_bytes(contents)
+                seed.chmod(0o400)
+                before = seed.stat()
+                _, dns, server = self.server(extra=("--dns-listen-host", "127.0.0.1",
+                                                    "--reset-seed", seed))
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
+                    other.bind(("127.0.0.2", dns))  # A wildcard listener would prevent this.
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as same:
+                        with self.assertRaises(OSError):
+                            same.bind(("127.0.0.1", dns))
+                    child, local = self.client([dns])
+                    with self.socks(local) as s:
+                        s.sendall(b"seed-bind"); self.assertEqual(exact(s, 9), b"seed-bind")
+                    child.terminate(); child.wait(3)
+                server.terminate(); self.assertEqual(server.wait(3), 0)
+                self.assertEqual(seed.read_bytes(), contents)
+                after = seed.stat()
+                self.assertEqual((after.st_ino, after.st_size, after.st_mtime_ns, after.st_mode),
+                                 (before.st_ino, before.st_size, before.st_mtime_ns, before.st_mode))
+                seed.chmod(0o600)
+
+    def test_server_rejects_bad_or_missing_reset_seed(self):
+        seed = pathlib.Path(self.tmp.name) / "bad-reset-seed"
+        args = ["--dns-listen-port", port(socket.SOCK_DGRAM), "--cert", self.cert,
+                "--key", self.key, "--domain", "t.test", "--reset-seed", seed]
+        for contents in (b"", b"0" * 31, b"0" * 33, b"g" * 32, b"0" * 32 + b"x",
+                         b"0" * 16 + b" " + b"0" * 16, b"0" * 32 + b"\x00", b"\xff" * 32):
+            with self.subTest(format_length=len(contents)):
+                seed.write_bytes(contents)
+                before = seed.stat()
+                child = self.spawn("slipstream-server", args)
+                self.assertEqual(child.wait(2), 2)
+                self.assertEqual(seed.read_bytes(), contents)
+                self.assertEqual(seed.stat().st_mtime_ns, before.st_mtime_ns)
+        seed.unlink()
+        child = self.spawn("slipstream-server", args)
+        self.assertEqual(child.wait(2), 2)
+        self.assertFalse(seed.exists(), "missing seed must not be generated")
+
+    def test_server_bind_validation_and_default_wildcard(self):
+        _, dns, _ = self.server()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
+            with self.assertRaises(OSError):
+                other.bind(("127.0.0.2", dns))
+        args = ["--dns-listen-port", port(socket.SOCK_DGRAM), "--cert", self.cert,
+                "--key", self.key, "--domain", "t.test"]
+        for extra in (("--dns-listen-host", "localhost"), ("--dns-listen-host", "::1"),
+                      ("--dns-listen-host", "127.0.0.1", "--dns-listen-ipv6")):
+            child = self.spawn("slipstream-server", [*args, *extra])
+            self.assertEqual(child.wait(2), 2)
+
     def test_halfclose_local_fin(self):
         b, dns, _ = self.server("after-fin")
         _, local = self.client([dns])

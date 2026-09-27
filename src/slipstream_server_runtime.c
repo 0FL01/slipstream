@@ -7,6 +7,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <arpa/inet.h>
 
 extern volatile sig_atomic_t should_shutdown;
 extern void server_sighandler(int);
@@ -76,14 +79,48 @@ static int server_loop_callback(picoquic_quic_t *quic, picoquic_packet_loop_cb_e
     return 0;
 }
 
+/* Read the Rust hex seed without creating or modifying the file. */
+static int load_reset_seed(const char *path, uint8_t seed[16]) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return -1;
+    size_t digits = 0;
+    int trailing = 0, invalid = 0, ch;
+    while ((ch = fgetc(file)) != EOF) {
+        if (isspace((unsigned char)ch)) {
+            if (digits) trailing = 1;
+            continue;
+        }
+        int value = ch >= '0' && ch <= '9' ? ch - '0' :
+            ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 :
+            ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (trailing || value < 0 || digits >= 32) { invalid = 1; break; }
+        if (!(digits & 1)) seed[digits / 2] = (uint8_t)(value << 4);
+        else seed[digits / 2] |= (uint8_t)value;
+        digits++;
+    }
+    invalid |= ferror(file) || digits != 32;
+    if (fclose(file)) invalid = 1;
+    return invalid ? -1 : 0;
+}
+
 int picoquic_slipstream_server(int port, bool ipv6, const char *cert, const char *key,
     struct sockaddr_storage *target, const char *const *domains, size_t domain_count,
-    size_t max_connections, size_t idle_timeout) {
+    size_t max_connections, size_t idle_timeout, const char *listen_host, const char *reset_seed_file) {
     if (!domain_count || max_connections == 0 || max_connections > 32 || !idle_timeout) return 2;
+    struct sockaddr_in listen_address = {0};
+    if (listen_host) {
+        if (ipv6 || inet_pton(AF_INET, listen_host, &listen_address.sin_addr) != 1) return 2;
+        listen_address.sin_family = AF_INET;
+        listen_address.sin_port = htons((uint16_t)port);
+    }
     server_domains = domains; server_domain_count = domain_count;
     ss_loop loop = {0}; loop.listener = -1; loop.head.target = *target;
     picoquic_quic_config_t config;
     picoquic_config_init(&config);
+    if (reset_seed_file) {
+        if (load_reset_seed(reset_seed_file, config.reset_seed)) return 2;
+        config.has_reset_seed = 1;
+    }
     config.nb_connections = (uint32_t)max_connections;
     config.server_cert_file = cert; config.server_key_file = key;
     config.server_port = port;
@@ -106,7 +143,7 @@ int picoquic_slipstream_server(int port, bool ipv6, const char *cert, const char
     thread.quic = quic; thread.param = &param;
     thread.loop_callback = server_loop_callback; thread.loop_callback_ctx = &loop;
     signal(SIGTERM, server_sighandler); signal(SIGINT, server_sighandler);
-    slipstream_packet_loop(&thread);
+    slipstream_packet_loop_bound(&thread, listen_host ? &listen_address : NULL);
     /* Keep the default context alive until picoquic destruction callbacks finish. */
     picoquic_free(quic);
     return should_shutdown ? 0 : thread.return_code;

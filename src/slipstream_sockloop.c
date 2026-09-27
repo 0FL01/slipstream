@@ -42,6 +42,7 @@
 #include "picoquic_internal.h"
 #include "picoquic_packet_loop.h"
 #include "slipstream_slot.h"
+#include "slipstream_runtime.h"
 
 # if defined(UDP_SEGMENT)
 static int udp_gso_available = 1;
@@ -90,7 +91,7 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
 
             if (!param->is_client && nb_slots_written == 0) {
                 // Server mode: wait for a packet to arrive
-                delta_t = 10000000;
+                delta_t = picoquic_get_next_wake_delay(quic, picoquic_current_time(), 10000000);
             }
 
             if (param->is_client && nb_slots_written == 0) {
@@ -106,8 +107,19 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             uint8_t buffer[buffer_size];
             int is_wake_up_event;
             int socket_rank = -1;
+            /* Server transport output can only ride a DNS request. QUIC's due
+             * send timer must not cause a spin while waiting for that request. */
+            if (!param->is_client) delta_t = 1000000;
+            /* Never wait or run lifecycle cleanup with pending response slots:
+             * those slots borrow connection pointers until this batch drains. */
+            if (delta_t > 0 && nb_slots_written == 0) {
+                int waited = ss_runtime_wait(loop_callback_ctx, s_ctx->fd, delta_t);
+                if (waited < 0 && errno != EINTR) return -1;
+                if (loop_callback(quic, picoquic_packet_loop_before_select, loop_callback_ctx, s_ctx) < 0)
+                    return 0;
+            }
             int bytes_recv = picoquic_packet_loop_select(s_ctx, 1, &peer_addr, &local_addr, &if_index_to, &received_ecn,
-                buffer, buffer_size, delta_t, &is_wake_up_event, thread_ctx, &socket_rank);
+                buffer, buffer_size, 0, &is_wake_up_event, thread_ctx, &socket_rank);
             if (bytes_recv < 0) {
                 /* The interrupt error is expected if the loop is closing. */
                 return thread_ctx->thread_should_close ? PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP : -1;
@@ -133,8 +145,10 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             bytes_recv = param->decode(slot, thread_ctx->loop_callback_ctx, &decoded,
                 (const unsigned char*)buffer, bytes_recv, &peer_addr, &local_addr);
             if (bytes_recv < 0) {
-                DBG_PRINTF("decode() failed with error %d\n", bytes_recv);
-                return bytes_recv;
+                /* Malformed DNS must not terminate the listener. */
+                free(decoded);
+                nb_slots_written--;
+                continue;
             }
 
             if (bytes_recv == 0) {
@@ -162,6 +176,8 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             }
             slot->cnx = last_cnx;
             slot->path_id = last_path_id;
+            if (last_path_id >= 0 && last_path_id < last_cnx->nb_paths)
+                slot->unique_path_id = last_cnx->path[last_path_id]->unique_path_id;
             nb_packet_received++;
 
             if (!param->is_client) {
@@ -185,8 +201,11 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             int if_index = param->dest_if;
             if (slot->error == RCODE_OKAY) {
                 picoquic_connection_id_t log_cid;
-                int ret;
+                int ret = 0;
                 if (!param->is_client && slot->cnx) {
+                    /* Resolve identity again: previous reply preparation can delete paths. */
+                    slot->path_id = picoquic_get_path_id_from_unique(slot->cnx, slot->unique_path_id);
+                    if (slot->path_id < 0) continue;
                     ret = picoquic_prepare_packet_ex(slot->cnx, slot->path_id, loop_time,
                         send_buffer, send_buffer_size, &send_length,
                         &peer_addr, &local_addr, &if_index, send_msg_ptr);
@@ -245,20 +264,26 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             nb_packets_sent++;
         }
 
-        if (!param->is_client || nb_packet_received == 0) {
+        if (!param->is_client) {
             continue;
         }
 
         size_t nb_polls_sent = 0;
-        nb_slots_read = 0;
-        while (nb_slots_read < nb_slots_written) {
+        ss_loop *application = loop_callback_ctx;
+        ss_conn *connection = &application->head;
+        for (int poll_path = 0; poll_path < connection->cnx->nb_paths; poll_path++) {
+          size_t poll_budget = ss_conn_poll_budget(connection, poll_path, loop_time);
+          bool sparse_attempt = poll_budget > 0 &&
+              (connection->phase == SS_WARM || connection->phase == SS_QUIET);
+          size_t sent_before = nb_polls_sent;
+          uint64_t poll_unique_id = connection->cnx->path[poll_path]->unique_path_id;
+          while (poll_budget-- > 0) {
             uint8_t send_buffer[send_buffer_size];
-            slot_t* slot = &slots[nb_slots_read];
-            assert(slot != NULL);
-            nb_slots_read++;
-            if (slot->cnx == NULL) {
-                continue; // in case the slot written was a bogus message
-            }
+            slot_t poll_slot = {0};
+            slot_t* slot = &poll_slot;
+            slot->cnx = connection->cnx;
+            int path_id = picoquic_get_path_id_from_unique(slot->cnx, poll_unique_id);
+            if (path_id < 0) break;
 
             slot->cnx->is_poll_requested = 1;
 
@@ -266,18 +291,19 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             struct sockaddr_storage peer_addr = {0};
             struct sockaddr_storage local_addr = {0};
             int if_index = param->dest_if;
-            int ret = picoquic_prepare_packet_ex(slot->cnx, -1, loop_time,
+            int ret = picoquic_prepare_packet_ex(slot->cnx, path_id, loop_time,
                 send_buffer, send_buffer_size, &send_length,
                 &peer_addr, &local_addr, &if_index, send_msg_ptr);
             if (ret < 0) {
                 return -1;
             }
             if (param->is_client && send_length == 0) {
+                slot->cnx->is_poll_requested = 0;
                 break;
             }
             if (slot->cnx->is_poll_requested == 1) {
-                // TODO: should we try again or skip this slot
-                continue;
+                slot->cnx->is_poll_requested = 0;
+                break;
             }
 
             int sock_err = 0;
@@ -314,6 +340,10 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             }
 
             nb_polls_sent++;
+          }
+          if (sparse_attempt)
+              connection->next_poll = ss_sparse_poll_deadline(connection->phase,
+                  loop_time, nb_polls_sent > sent_before);
         }
 
         // if (param->is_client) {

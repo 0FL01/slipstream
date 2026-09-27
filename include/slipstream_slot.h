@@ -11,6 +11,7 @@ typedef struct st_slot_t {
     struct sockaddr_storage local_addr;
     picoquic_cnx_t* cnx;
     int path_id;
+    uint64_t unique_path_id;
     bool is_poll_packet;
 } slot_t;
 

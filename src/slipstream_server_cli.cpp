@@ -12,7 +12,9 @@ struct ServerArgs : MainArguments<ServerArgs> {
     bool listen_ipv6 = option("dns-listen-ipv6", '6', "DNS listen on IPv6 (default: false)") = false;
     std::string target_address = option("target-address", 'a', "Target server address (default: 127.0.0.1:5201)") = "127.0.0.1:5201";    std::string cert = option("cert", 'c', "Certificate file path (default: certs/cert.pem)") = "certs/cert.pem";
     std::string key = option("key", 'k', "Private key file path (default: certs/key.pem)") = "certs/key.pem";
-    std::string domain = option("domain", 'd', "Domain name this server is authoritative for (Required)");
+    std::vector<std::string> domain = option("domain", 'd', "Authoritative suffix (repeatable, required)");
+    int max_connections = option("max-connections", '\0', "Maximum transport connections (1..32)") = 32;
+    int idle_timeout = option("idle-timeout-seconds", '\0', "Transport idle timeout seconds") = 30;
 
     static std::string help(const std::string& program_name) {
         return "slipstream-server - A high-performance covert channel over DNS (server)\n\n" 
@@ -46,6 +48,13 @@ int main(int argc, char** argv) {
         std::cerr << "Server error: Missing required --domain option" << std::endl;
         exit(1);
     }
+    if (args.max_connections < 1 || args.max_connections > 32 || args.idle_timeout < 1 ||
+        args.listen_port < 1 || args.listen_port > 65535) return 2;
+    std::vector<const char*> domains;
+    for (const auto& domain : args.domain) {
+        if (domain.empty() || domain.size() > 180) return 2;
+        domains.push_back(domain.c_str());
+    }
 
     // Process target address
     struct sockaddr_storage target_address;
@@ -74,7 +83,7 @@ int main(int argc, char** argv) {
         (char*)args.cert.c_str(),
         (char*)args.key.c_str(),
         &target_address,
-        (char*)args.domain.c_str()
+        domains.data(), domains.size(), args.max_connections, args.idle_timeout
     );
 
 #ifdef _WINDOWS

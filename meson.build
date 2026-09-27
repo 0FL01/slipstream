@@ -24,6 +24,9 @@ spcdns = extern / 'SPCDNS' / src
 
 # Sources common to both client and server
 common_sources = files(
+  src / 'slipstream_flow.c',
+  src / 'slipstream_pin.c',
+  src / 'slipstream_bridge.c',
   src / 'slipstream_sockloop.c',
   src / 'slipstream_utils.c',
   src / 'slipstream_inline_dots.c',
@@ -51,6 +54,8 @@ endif
 
 # Import the CMake module
 cmake = import('cmake')
+python = import('python').find_installation('python3')
+run_command(python, files('patches/apply-picoquic-patch.py'), check: true)
 
 # Get the cmake options objects
 picoquic_opts = cmake.subproject_options()
@@ -68,15 +73,7 @@ picoquic_opts.add_cmake_defines(
   ],
 )
 # Configure picoquic debug printing
-if get_option('buildtype').startswith('debug')
-  picoquic_opts.add_cmake_defines(
-    {'DISABLE_DEBUG_PRINTF': 'OFF'},
-  )
-else
-  picoquic_opts.add_cmake_defines(
-    {'DISABLE_DEBUG_PRINTF': 'ON'},
-  )
-endif
+picoquic_opts.add_cmake_defines({'DISABLE_DEBUG_PRINTF': 'ON'})
 # Configure optional picoquic logging
 loglib_enabled = get_option('build_loglib')
 if loglib_enabled
@@ -100,6 +97,12 @@ picoquic_proj = cmake.subproject(
 slipstream_cli_deps = [
   dependency('threads'), # for picoquic
   picoquic_proj.dependency('picoquic-core'),
+  picoquic_proj.dependency('picotls-core'),
+  picoquic_proj.dependency('picotls-openssl'),
+  picoquic_proj.dependency('picotls-minicrypto'),
+  picoquic_proj.dependency('picotls-fusion'),
+  dependency('openssl'),
+  meson.get_compiler('c').find_library('m'),
 ]
 # Link optional picoquic logging
 if loglib_enabled
@@ -108,19 +111,21 @@ endif
 
 # Sources only used by client
 client_sources = files(
+  src / 'slipstream_client_runtime.c',
   src / 'slipstream_client.c',
   src / 'slipstream_client_cli.cpp',
 )
 
 # Sources only used by server
 server_sources = files(
+  src / 'slipstream_server_runtime.c',
   src / 'slipstream_server.c',
   src / 'slipstream_server_cc.c',
   src / 'slipstream_server_cli.cpp',
 )
 
 # The final client executable
-executable(
+client_exe = executable(
   'slipstream-client',
   client_sources + common_sources,
   dependencies: slipstream_cli_deps,
@@ -130,7 +135,7 @@ executable(
 )
 
 # The final server executable
-executable(
+server_exe = executable(
   'slipstream-server',
   server_sources + common_sources,
   dependencies: slipstream_cli_deps,
@@ -138,3 +143,20 @@ executable(
   link_args: link_args,
   build_by_default: true,
 )
+
+protocol_test = executable('test-protocol',
+  files('tests/test_protocol.c', src / 'slipstream_flow.c', src / 'slipstream_bridge.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('protocol', protocol_test)
+path_test = executable('test-path-guard', files('tests/test_path_guard.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('path-guard', path_test)
+pin_test = executable('test-pin', files('tests/test_pin.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('pin', pin_test)
+test('runtime', python,
+  args: [files('tests/test_runtime.py'), meson.current_build_dir()],
+  depends: [client_exe, server_exe], timeout: 120)

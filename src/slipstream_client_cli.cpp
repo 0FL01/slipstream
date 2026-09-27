@@ -14,6 +14,10 @@ struct ClientArgs : MainArguments<ClientArgs> {
     bool gso = option('g', "GSO enabled (true/false) (default: false). Use --gso or --gso=true to enable.");
     std::string domain = option("domain", 'd', "Domain name used for the covert channel (Required)");
     int keep_alive_interval = option("keep-alive-interval", 't', "Send keep alive pings at this interval (default: 400, disabled: 0)") = 400;
+    int idle_keep_alive_interval = option("idle-keep-alive-interval", '\0', "Idle keepalive milliseconds") = 5000;
+    std::string listen_host = option("tcp-listen-host", '\0', "Local TCP listen IPv4 address") = "127.0.0.1";
+    std::string cert = option("cert", '\0', "Pinned server certificate PEM (required)");
+    bool flow_relay_stdin = option("flow-relay-stdin", '\0', "Read exact 80-byte FlowRelay bootstrap from stdin") = false;
 
     static std::string help(const std::string& program_name) {
         return "slipstream-client - A high-performance covert channel over DNS (client)\n\n" 
@@ -51,13 +55,16 @@ int main(int argc, char** argv) {
         std::cerr << "Client error: Missing required --resolver option (at least one required)" << std::endl;
         exit(1);
     }
+    if (args.cert.empty() || args.listen_port < 1 || args.listen_port > 65535 ||
+        args.keep_alive_interval < 0 || args.idle_keep_alive_interval < 0 ||
+        args.resolver.size() > 8) return 2;
 
     // Process resolver addresses
     std::vector<st_address_t> resolver_addresses;
     bool ipv4 = false;
     bool ipv6 = false;
     for (const auto& res_str : args.resolver) {
-        st_address_t addr;
+        st_address_t addr = {};
         char server_name[256];
         int server_port = 53;
 
@@ -81,6 +88,7 @@ int main(int argc, char** argv) {
                 exit(1);
             }
         } else {
+            ipv4 = true;
             if (sscanf(res_str.c_str(), "%255[^:]:%d", server_name, &server_port) < 1) {
                 strncpy(server_name, res_str.c_str(), sizeof(server_name) - 1);
                 server_name[sizeof(server_name) - 1] = '\0';
@@ -114,7 +122,11 @@ int main(int argc, char** argv) {
         (char*)args.domain.c_str(),
         (char*)args.congestion_control.c_str(),
         args.gso,
-        args.keep_alive_interval
+        args.keep_alive_interval,
+        args.idle_keep_alive_interval,
+        args.listen_host.c_str(),
+        args.cert.c_str(),
+        args.flow_relay_stdin
     );
 
 #ifdef _WINDOWS

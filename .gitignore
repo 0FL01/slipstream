@@ -5,6 +5,9 @@ qlog/
 .tmp.*
 .DS_Store
 build/
+/build-*/
+__pycache__/
+*.pyc
 subprojects/.wraplock
 
 sample_ticket_store.bin

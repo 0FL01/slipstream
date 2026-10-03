@@ -157,6 +157,27 @@ pin_test = executable('test-pin', files('tests/test_pin.c'),
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('pin', pin_test)
+server_codec_test = executable('test-server-codec',
+  files('tests/test_server_codec.c', src / 'slipstream_utils.c',
+    src / 'slipstream_inline_dots.c', lua_resty / 'base32.c',
+    spcdns / 'codec.c', spcdns / 'mappings.c', spcdns / 'netsimple.c', spcdns / 'output.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('server-codec', server_codec_test)
+# Explicit synthetic-only target: aggregate diagnostics never enter server_exe.
+feedback_wrap_args = ['-Wl,--wrap=picoquic_is_sending_authorized_by_pacing',
+  '-Wl,--wrap=picoquic_prepare_packet_ex', '-Wl,--wrap=picoquic_open_flow_control']
+executable('test-server-feedback', server_sources + common_sources + files('tests/server_feedback_diag.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  link_args: link_args + feedback_wrap_args,
+  build_by_default: false)
+executable('test-client-feedback', client_sources + common_sources + files('tests/client_feedback_diag.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  link_args: link_args + [feedback_wrap_args[0], feedback_wrap_args[1]], build_by_default: false)
+feedback_diag_test = executable('test-server-feedback-diag', files('tests/test_server_feedback_diag.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  link_args: link_args + feedback_wrap_args, c_args: ['-UNDEBUG'])
+test('server-feedback-diag', feedback_diag_test)
 test('runtime', python,
   args: [files('tests/test_runtime.py'), meson.current_build_dir()],
   depends: [client_exe, server_exe], timeout: 120)

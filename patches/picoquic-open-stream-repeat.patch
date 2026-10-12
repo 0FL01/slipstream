@@ -1,0 +1,15 @@
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -3174,7 +3174,10 @@
+-                if (is_preemptive_needed != NULL && stream->fin_sent) {
++                /* Policy experiment: extend intentional FIN-only eligibility to
++                 * needed, nonempty data on persistent open streams. */
++                if (is_preemptive_needed != NULL &&
++                    (stream->fin_sent || (!*no_need_to_repeat && data_length > 0))) {
+                     *is_preemptive_needed |= 1;
+                 }
+             }
+         }
+     }
+     else {

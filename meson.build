@@ -178,6 +178,10 @@ stream_ack_ranges_test = executable('test-stream-ack-ranges', files('tests/test_
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('stream-ack-ranges', stream_ack_ranges_test)
+open_stream_repeat_test = executable('test-open-stream-repeat', files('tests/test_open_stream_repeat.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('open-stream-repeat', open_stream_repeat_test)
 server_dns_test = executable('test-server-dns',
   files('tests/test_server_dns.c', src / 'slipstream_server.c',
     src / 'slipstream_inline_dots.c', src / 'slipstream_utils.c',

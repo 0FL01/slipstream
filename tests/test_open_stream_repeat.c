@@ -1,0 +1,242 @@
+#include <picoquic_config.h>
+#include <picoquic_internal.h>
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Existing internal sender entry point; no production API is added. */
+int picoquic_preemptive_retransmit_in_context(picoquic_cnx_t *cnx,
+    picoquic_packet_context_t *pkt_ctx, uint64_t rtt, uint64_t current_time,
+    uint64_t *next_wake_time, uint8_t *new_bytes, size_t capacity,
+    size_t *length, int *has_data, int *more_data, int test_only);
+
+static const picoquic_packet_context_enum application = picoquic_packet_context_application;
+static const uint8_t payload[] = {'a', 'b', 'c', 0, 1, 2, 0xff, 'd', 'e', 'f', 'g'};
+
+static picoquic_cnx_t *connection(uint64_t *now, int client) {
+    picoquic_quic_config_t config;
+    picoquic_config_init(&config);
+    config.nb_connections = 1; config.alpn = "test"; config.enable_sslkeylog = 0;
+    config.do_preemptive_repeat = 1;
+    picoquic_quic_t *quic = picoquic_create_and_configure(&config, NULL, NULL, *now, now);
+    assert(quic);
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(53);
+    picoquic_cnx_t *cnx = picoquic_create_cnx(quic, picoquic_null_connection_id,
+        picoquic_null_connection_id, (struct sockaddr *)&address, *now, 0, "test", "test", client);
+    assert(cnx);
+    cnx->cnx_state = picoquic_state_ready;
+    /* Symmetric default transport parameters stand in for completed negotiation. */
+    cnx->remote_parameters = cnx->local_parameters;
+    cnx->maxdata_remote = cnx->remote_parameters.initial_max_data;
+    cnx->max_stream_id_bidir_remote = STREAM_ID_FROM_RANK(
+        cnx->remote_parameters.initial_max_stream_id_bidir, client, 0);
+    cnx->latest_progress_time = cnx->latest_receive_time = *now;
+    cnx->path[0]->smoothed_rtt = 240000;
+    cnx->path[0]->retransmit_timer = 720000;
+    cnx->path[0]->p_remote_cnxid->cnx_id.id_len = 8;
+    memset(cnx->path[0]->p_remote_cnxid->cnx_id.id, 0xa5, 8);
+    return cnx;
+}
+
+static size_t stream_frame(picoquic_cnx_t *cnx, uint8_t *frame, size_t capacity) {
+    int more = 0, pure_ack = 1, active = 0, ret = 0;
+    uint8_t *end = picoquic_format_stream_frame(cnx, picoquic_find_stream(cnx, 0),
+        frame, frame + capacity, &more, &pure_ack, &active, &ret);
+    assert(ret == 0 && end > frame && end <= frame + capacity && !pure_ack);
+    return (size_t)(end - frame);
+}
+
+static picoquic_packet_t *pending(picoquic_cnx_t *cnx, const uint8_t *frame,
+    size_t length, uint64_t now) {
+    picoquic_packet_context_t *ctx = &cnx->pkt_ctx[application];
+    picoquic_path_t *path = cnx->path[0];
+    picoquic_packet_t *packet = picoquic_create_packet(cnx->quic);
+    assert(packet);
+    packet->ptype = picoquic_packet_1rtt_protected; packet->pc = application;
+    size_t header = picoquic_predict_packet_header_length(cnx, packet->ptype, ctx);
+    size_t pn_offset = 0, pn_length = 0;
+    packet->offset = picoquic_create_packet_header(cnx, packet->ptype,
+        ctx->send_sequence, path, header, packet->bytes, &pn_offset, &pn_length);
+    assert(packet->offset == header && pn_length > 0);
+    packet->sequence_number = ctx->send_sequence++;
+    packet->send_path = path; packet->send_time = now;
+    packet->delivered_prior = path->delivered_last;
+    packet->delivered_time_prior = path->delivered_time_last;
+    packet->delivered_sent_prior = path->delivered_sent_last;
+    packet->lost_prior = path->total_bytes_lost;
+    packet->inflight_prior = path->bytes_in_transit;
+    memcpy(packet->bytes + packet->offset, frame, length);
+    packet->length = packet->offset + length; packet->checksum_overhead = 16;
+    picoquic_queue_for_retransmit(cnx, path, packet, packet->length + 16, now);
+    assert(ctx->pending_last == packet);
+    return packet;
+}
+
+static int repeat(picoquic_cnx_t *cnx, uint64_t now, uint8_t *bytes,
+    size_t capacity, size_t *length, uint64_t *wake) {
+    int has_data = 0, more = 0;
+    *length = 0; *wake = UINT64_MAX;
+    assert(picoquic_preemptive_retransmit_in_context(cnx, &cnx->pkt_ctx[application],
+        cnx->path[0]->smoothed_rtt, now, wake, bytes, capacity, length,
+        &has_data, &more, 0) == 0);
+    assert(more == 0);
+    return has_data;
+}
+
+struct received { uint8_t bytes[sizeof(payload)]; size_t length; unsigned fins; };
+
+static int receive_bytes(picoquic_cnx_t *cnx, uint64_t stream_id, uint8_t *bytes,
+    size_t length, picoquic_call_back_event_t event, void *context, void *stream_context) {
+    (void)cnx; (void)stream_context;
+    struct received *received = context;
+    if (event == picoquic_callback_stream_data || event == picoquic_callback_stream_fin) {
+        assert(stream_id == 0 && received->length + length <= sizeof(received->bytes));
+        memcpy(received->bytes + received->length, bytes, length);
+        received->length += length;
+        received->fins += event == picoquic_callback_stream_fin;
+    }
+    return 0;
+}
+
+static void decode(picoquic_cnx_t *cnx, const uint8_t *bytes, size_t length, uint64_t now) {
+    picoquic_path_t *path = cnx->path[0];
+    assert(picoquic_decode_frames(cnx, path, bytes, length, NULL, picoquic_epoch_1rtt,
+        (struct sockaddr *)&path->peer_addr, (struct sockaddr *)&path->local_addr,
+        0, 0, now) == 0);
+}
+
+/* The final expectation is deliberately identical on both builds: the baseline
+ * FIN-only policy fails the open-data assertion, rather than being a bug gate. */
+static void early_copy(int fin, int empty) {
+    uint64_t now = 1000000;
+    picoquic_cnx_t *cnx = connection(&now, 1);
+    uint8_t prefix[64], frame[64], copy[64];
+    assert(picoquic_add_to_stream(cnx, 0, payload, 3, 0) == 0);
+    size_t prefix_length = stream_frame(cnx, prefix, sizeof(prefix));
+    size_t data_length = empty ? 0 : sizeof(payload) - 3;
+    assert(picoquic_add_to_stream(cnx, 0, payload + 3, data_length, fin) == 0);
+    size_t frame_length = stream_frame(cnx, frame, sizeof(frame));
+    picoquic_stream_head_t *stream = picoquic_find_stream(cnx, 0);
+    assert(stream && stream->fin_sent == (unsigned)fin && !stream->reset_sent);
+    uint64_t id = UINT64_MAX, offset = UINT64_MAX;
+    size_t parsed_length = 0, consumed = 0; int parsed_fin = -1;
+    assert(picoquic_parse_stream_header(frame, frame_length, &id, &offset,
+        &parsed_length, &parsed_fin, &consumed) == 0);
+    assert(id == 0 && offset == 3 && parsed_length == data_length && parsed_fin == fin);
+    assert(consumed + data_length == frame_length);
+    assert(memcmp(frame + consumed, payload + 3, data_length) == 0);
+    picoquic_packet_t *packet = pending(cnx, frame, frame_length, now);
+    picoquic_packet_context_t *ctx = &cnx->pkt_ctx[application];
+    uint64_t inflight = cnx->path[0]->bytes_in_transit;
+    uint64_t rtt = cnx->path[0]->smoothed_rtt;
+    uint64_t early_delay = rtt > 8 * PICOQUIC_ACK_DELAY_MAX ? rtt / 8 : PICOQUIC_ACK_DELAY_MAX;
+    assert(early_delay <= rtt / 2);
+    uint64_t early_time = now + early_delay, wake = 0; size_t length = 0;
+    assert(!repeat(cnx, early_time - 1, copy, sizeof(copy), &length, &wake));
+    assert(length == 0 && wake == early_time && !packet->was_preemptively_repeated);
+
+    /* Use the real loss-recovery entry point before the early copy. Neither
+     * loss nor PTO is due, and the ordinary wake is the real path timer. */
+    picoquic_packet_t *ordinary = picoquic_create_packet(cnx->quic);
+    assert(ordinary);
+    size_t header = 0; wake = UINT64_MAX;
+    assert(picoquic_retransmit_needed(cnx, application, cnx->path[0], early_time,
+        &wake, ordinary, sizeof(ordinary->bytes), &header) == 0);
+    assert(wake == now + picoquic_current_retransmit_timer(cnx, cnx->path[0]));
+    assert(early_time < wake && !cnx->path[0]->is_pto_required);
+    picoquic_recycle_packet(cnx->quic, ordinary);
+    int has_data = repeat(cnx, early_time, copy, sizeof(copy), &length, &wake);
+    fprintf(stderr, "POLICY %s%s: has_data=%d, length=%zu, early=%llu us, PTO=%llu us\n",
+        fin ? "FIN" : "open", empty ? "-only" : "-data", has_data, length,
+        (unsigned long long)early_delay,
+        (unsigned long long)picoquic_current_retransmit_timer(cnx, cnx->path[0]));
+    assert(has_data == 1 && length == frame_length);
+    assert(memcmp(copy, frame, frame_length) == 0);
+    assert(ctx->pending_first == packet && ctx->pending_last == packet);
+    assert(packet->packet_next == NULL && packet->packet_previous == NULL);
+    assert(packet->send_time == now && packet->sequence_number == 0);
+    assert(packet->was_preemptively_repeated && cnx->nb_preemptive_repeat == 1);
+    assert(cnx->path[0]->bytes_in_transit == inflight);
+    assert(memcmp(packet->bytes + packet->offset, frame, frame_length) == 0);
+
+    struct received received = {0};
+    picoquic_cnx_t *peer = connection(&now, 0);
+    picoquic_set_callback(peer, receive_bytes, &received);
+    decode(peer, prefix, prefix_length, early_time);
+    decode(peer, copy, length, early_time);
+    decode(peer, packet->bytes + packet->offset, frame_length, early_time + 1);
+    decode(peer, copy, length, early_time + 2);
+    assert(received.length == 3 + data_length && received.fins == (unsigned)fin);
+    assert(memcmp(received.bytes, payload, received.length) == 0);
+    picoquic_free(peer->quic);
+
+    for (unsigned i = 0; i < 3; i++) {
+        assert(!repeat(cnx, early_time + i, copy, sizeof(copy), &length, &wake));
+        assert(length == 0 && packet->was_preemptively_repeated);
+        assert(ctx->pending_first == packet && ctx->pending_last == packet);
+        assert(cnx->nb_preemptive_repeat == 1 && cnx->path[0]->bytes_in_transit == inflight);
+    }
+    picoquic_free(cnx->quic);
+}
+
+enum suppression { acked, reset, destroyed, zero_data };
+
+static void suppressed(enum suppression reason) {
+    uint64_t now = 1000000;
+    picoquic_cnx_t *cnx = connection(&now, 1);
+    uint8_t frame[64], copy[64]; size_t frame_length;
+    assert(picoquic_add_to_stream(cnx, 0, payload, sizeof(payload), 0) == 0);
+    frame_length = stream_frame(cnx, frame, sizeof(frame));
+    picoquic_stream_head_t *stream = picoquic_find_stream(cnx, 0);
+    assert(stream && !stream->fin_sent);
+    if (reason == zero_data) {
+        uint8_t *end = picoquic_format_stream_frame_header(frame, frame + sizeof(frame), 0, 3);
+        assert(end);
+        frame[0] |= 2; *end++ = 0; /* Valid explicit-length, non-FIN, empty STREAM. */
+        frame_length = (size_t)(end - frame);
+    }
+    /* ACKed/destroyed/empty open STREAMs must not enable a needed PING either.
+     * Real RESET sets fin_sent as well: check its STREAM suppression alone to
+     * retain the intentional baseline FIN policy for other packet frames. */
+    if (reason != reset) frame[frame_length++] = picoquic_frame_type_ping;
+    picoquic_packet_t *packet = pending(cnx, frame, frame_length, now);
+    if (reason == acked) {
+        packet = pending(cnx, frame, frame_length, now);
+        const uint8_t ack[] = {picoquic_frame_type_ack, 0, 0, 0, 0};
+        decode(cnx, ack, sizeof(ack), now + 10000);
+        assert(cnx->pkt_ctx[application].pending_first == packet);
+        assert(picoquic_check_sack_list(&stream->sack_list, 0, sizeof(payload) - 1));
+        /* Keep this suppression check inside the existing repeat age window,
+         * independent of the ACK decoder's new RTT estimate. */
+        cnx->path[0]->smoothed_rtt = 240000;
+    } else if (reason == reset) {
+        assert(picoquic_reset_stream(cnx, 0, 1) == 0);
+        uint8_t reset_frame[64];
+        assert(stream_frame(cnx, reset_frame, sizeof(reset_frame)) > 0);
+        assert(stream->reset_sent);
+    } else if (reason == destroyed) {
+        picoquic_delete_stream(cnx, stream);
+        assert(picoquic_find_stream(cnx, 0) == NULL);
+    }
+    uint64_t wake = 0, inflight = cnx->path[0]->bytes_in_transit;
+    size_t length = 0;
+    assert(!repeat(cnx, now + PICOQUIC_ACK_DELAY_MAX, copy, sizeof(copy), &length, &wake));
+    assert(length == 0 && !packet->was_preemptively_repeated && cnx->nb_preemptive_repeat == 0);
+    assert(cnx->pkt_ctx[application].pending_first == packet);
+    assert(cnx->pkt_ctx[application].pending_last == packet);
+    assert(cnx->path[0]->bytes_in_transit == inflight);
+    picoquic_free(cnx->quic);
+}
+
+int main(void) {
+    early_copy(1, 0);
+    early_copy(1, 1); /* Empty FIN retains the baseline eligibility. */
+    suppressed(acked); suppressed(reset); suppressed(destroyed); suppressed(zero_data);
+    fputs("POLICY controls: FIN, ACKed, reset, destroyed, zero-data, peer duplicate PASS\n", stderr);
+    early_copy(0, 0);
+    fputs("POLICY open-data early copy: PASS (one copy, pending retained, peer bytes once)\n", stderr);
+    return 0;
+}

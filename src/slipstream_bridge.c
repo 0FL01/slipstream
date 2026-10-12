@@ -259,6 +259,20 @@ size_t ss_conn_poll_budget(ss_conn *c, int path_id, uint64_t now) {
                     ceil((double)p->cwin / (double)mtu);
     size_t inflight = (size_t)((p->bytes_in_transit + mtu - 1) / mtu);
     size_t wanted = target > 64 ? 64 : (size_t)target;
+    /* Experimental outstanding-packet cap, in addition to byte occupancy.
+     * Traps and legacy packets on other paths still consume scan work. */
+    picoquic_packet_context_t *context = c->cnx->is_multipath_enabled ? &p->pkt_ctx :
+        &c->cnx->pkt_ctx[picoquic_packet_context_application];
+    picoquic_packet_t *pending = context->pending_first;
+    size_t count = 0, scanned = 0;
+    while (pending && count < wanted && scanned < 64) {
+        if (!pending->is_ack_trap && pending->send_path == p) count++;
+        pending = pending->packet_next;
+        scanned++;
+    }
+    /* An unresolved tail at the work cap conservatively fills the target. */
+    if (pending && count < wanted) count = wanted;
+    if (count > inflight) inflight = count;
     size_t budget = ss_poll_budget(phase, wanted > inflight ? wanted - inflight : 0,
                                    now >= c->next_poll, ready, blocked);
     return budget > 16 ? 16 : budget;

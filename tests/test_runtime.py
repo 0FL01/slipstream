@@ -255,6 +255,38 @@ class Parity(unittest.TestCase):
         self.assertFalse(b.errors)
         self.assertIsNone(server.poll())
 
+    def test_low_rate_three_streams_idle_to_active(self):
+        b, dns, server = self.server()
+        relay = Relay(dns); self.resources.append(relay)
+        child, local = self.client([relay.port])
+        barrier = threading.Barrier(3, timeout=5)
+
+        def transfer(lane):
+            interval, count, size = ((.04, 50, 100), (.2, 10, 28), (1, 3, 24))[lane]
+            with self.socks(local) as s:
+                s.settimeout(5)
+                warmup = bytes([lane]) + b"ready"
+                s.sendall(warmup)
+                self.assertEqual(exact(s, len(warmup)), warmup)
+                barrier.wait()
+                time.sleep(1.3)  # Open streams settle from BUSY through WARM to QUIET.
+                barrier.wait()
+                start = time.monotonic()
+                for seq in range(count):
+                    time.sleep(max(0, start + seq * interval - time.monotonic()))
+                    frame = bytes([lane]) + seq.to_bytes(4, "big") + bytes([(lane + seq) % 256]) * (size - 5)
+                    s.sendall(frame)
+                    self.assertEqual(exact(s, size), frame, "low-rate bytes/sequence mismatch")
+                s.shutdown(socket.SHUT_WR)
+                self.assertEqual(s.recv(1), b"")
+
+        with concurrent.futures.ThreadPoolExecutor(3) as pool:
+            list(pool.map(transfer, range(3)))
+        self.assertEqual(len(b.opens), 3)
+        self.assertFalse(b.errors)
+        self.assertGreater(relay.count, 0)
+        self.assertIsNone(child.poll()); self.assertIsNone(server.poll())
+
     def test_server_explicit_bind_and_read_only_reset_seed(self):
         seed = pathlib.Path(self.tmp.name) / "reset-seed"
         for contents in (b"0123456789abcdef" * 2 + b"\n",

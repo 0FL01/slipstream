@@ -236,11 +236,14 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
                 (const unsigned char*)send_buffer, send_length, &segment_len, &peer_addr, &local_addr);
             if (encoded_len <= 0) {
                 DBG_PRINTF("Encoding fails, ret=%d\n", encoded_len);
+                free(encoded);
+                if (param->is_client) return -1;
                 continue;
             }
 
             if (encoded_len < segment_len) {
                 DBG_PRINTF("Encoded len shorter than original: %d < %d", encoded_len, segment_len);
+                free(encoded);
                 return -1;
             }
 
@@ -294,15 +297,13 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             int ret = picoquic_prepare_packet_ex(slot->cnx, path_id, loop_time,
                 send_buffer, send_buffer_size, &send_length,
                 &peer_addr, &local_addr, &if_index, send_msg_ptr);
+            /* This request belongs to this prepare call. A finalized data/ACK
+             * packet still needs submission even if no POLL consumed it. */
+            slot->cnx->is_poll_requested = 0;
             if (ret < 0) {
                 return -1;
             }
             if (param->is_client && send_length == 0) {
-                slot->cnx->is_poll_requested = 0;
-                break;
-            }
-            if (slot->cnx->is_poll_requested == 1) {
-                slot->cnx->is_poll_requested = 0;
                 break;
             }
 
@@ -314,11 +315,13 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
                 (const unsigned char*)send_buffer, send_length, &segment_len, &peer_addr, &local_addr);
             if (encoded_len <= 0) {
                 DBG_PRINTF("Encoding fails, ret=%d\n", encoded_len);
-                continue;
+                free(encoded);
+                return -1;
             }
 
             if (encoded_len < segment_len) {
                 DBG_PRINTF("Encoded len shorter than original: %d < %d", encoded_len, segment_len);
+                free(encoded);
                 return -1;
             }
 

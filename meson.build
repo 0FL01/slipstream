@@ -157,6 +157,11 @@ pin_test = executable('test-pin', files('tests/test_pin.c'),
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('pin', pin_test)
+poll_submit_test = executable('test-poll-submit',
+  files('tests/test_poll_submit.c', src / 'slipstream_flow.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('poll-submit', poll_submit_test)
 test('runtime', python,
   args: [files('tests/test_runtime.py'), meson.current_build_dir()],
   depends: [client_exe, server_exe], timeout: 120)

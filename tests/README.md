@@ -5,7 +5,7 @@ The runtime test depends on both executables, so Meson rebuilds them before test
 Python 3 and OpenSSL's CLI are required; all services, certificates and credentials
 are ephemeral and confined to loopback. Native stdout/stderr must stay empty.
 
-The four suites cover:
+The suites cover:
 
 - `protocol`: exact 80-byte stdin credentials, fragmented SOCKS authentication,
   FlowRelay TCP and UoT framing, scheduler thresholds, and forced partial socket
@@ -15,11 +15,21 @@ The four suites cover:
 - `pin`: the actual certificate/signature callbacks with valid RSA-PSS,
   RSA-PKCS1, EC and Ed25519 signatures; tampered signatures, changed transcripts,
   unsupported algorithms, missing signature bytes and mismatched leaf DER fail.
+- `server-dns`: actual server decode/encode through SPCDNS wire bytes; in-zone
+  IN-class NS/A/AAAA (and other non-TXT) return authoritative NOERROR/NODATA at
+  apex and label-boundary subdomains, with case/trailing-dot variants. Non-IN,
+  outside/impostor names, TXT positive/empty/error and malformed-query behavior,
+  IDs, question echo, addresses and current OPT semantics are checked. A strict
+  RFC9156-style walk must reach a descendant TXT instead of cutting on ancestor
+  NXDOMAIN, while the same descendant is also checked directly.
 - `runtime`: both server suffixes, independent concurrent streams, exact payloads,
   512 KiB upload followed by response after local FIN, remote-first FIN with the
   upload half still open, authentication/token/pin rejection, unchanged UoT
   records, bounded setup/bootstrap, malformed DNS, connection-slot reclamation,
-  multipath loss and quiet/empty polling bounds.
+  multipath loss and quiet/empty polling bounds. The low-rate three-stream
+  idle-to-active bytes/FIN gate also runs through a small strict QName-minimizing
+  relay that probes the zone apex and one-label-below-zone before forwarding
+  actual client TXT requests; TLS and the real client/server are exercised.
 
 For lifecycle checks, use a separate debug build with
 `-Db_sanitize=address,undefined -Ddefault_library=static`. Sanitizer failures are
@@ -36,7 +46,8 @@ configuration and reject unexpected source revisions.
 
 These gates establish local C/C correctness. Cross-implementation interoperability,
 recursive carrier performance and benefit relative to Rust belong to the separate
-A/B campaign.
+A/B campaign. The strict QName relay is a synthetic continuation/cut fixture,
+not a full recursive resolver or evidence of the real 180-second call gate.
 
 For a local, synthetic credit-feedback probe (not the recursive A/B runner):
 

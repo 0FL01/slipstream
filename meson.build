@@ -170,6 +170,13 @@ path_ack_context_test = executable('test-path-ack-context', files('tests/test_pa
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('path-ack-context', path_ack_context_test)
+server_dns_test = executable('test-server-dns',
+  files('tests/test_server_dns.c', src / 'slipstream_server.c',
+    src / 'slipstream_inline_dots.c', src / 'slipstream_utils.c',
+    lua_resty / 'base32.c', spcdns / 'codec.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('server-dns', server_dns_test)
 test('runtime', python,
   args: [files('tests/test_runtime.py'), meson.current_build_dir()],
   depends: [client_exe, server_exe], timeout: 120)

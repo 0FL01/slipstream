@@ -129,7 +129,7 @@ class Relay:
                     data, self.client = self.sock.recvfrom(4096)
                     self.count += 1
                     if not self.drop:
-                        self.upstream.sendto(data, self.target)
+                        self.forward(data)
             except socket.timeout:
                 pass
             except OSError:
@@ -144,8 +144,56 @@ class Relay:
             except OSError:
                 break
 
+    def forward(self, data):
+        self.upstream.sendto(data, self.target)
+
     def close(self):
         self.closed = True; self.sock.close(); self.upstream.close(); self.thread.join(1)
+
+class QNameMinimizingRelay(Relay):
+    """Strict synthetic RFC9156 NODATA-continue/NXDOMAIN-cut at the t.test authority."""
+    def __init__(self, target):
+        self.probes = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.probes.settimeout(.5)
+        self.probe_count = self.forwarded_txt = self.cuts = 0
+        self.errors = []
+        super().__init__(target)
+
+    def forward(self, data):
+        # Actual client queries use a single, uncompressed IN/TXT question.
+        labels, at = [], 12
+        while at < len(data) and 0 < data[at] < 64:
+            size = data[at]
+            labels.append(data[at + 1:at + 1 + size]); at += size + 1
+        if (labels[-2:] != [b"t", b"test"] or data[at:at + 5] != b"\0\0\x10\0\x01"
+                or data[4:10] != b"\0\x01\0\0\0\0"):
+            self.errors.append("unexpected client question"); return
+        # Known delegation is t.test. Walk apex and one-label-below-zone before
+        # forwarding the original full QName, using a separate probe endpoint.
+        for suffix in (labels[-2:], labels[-3:]):
+            name = b"".join(bytes([len(label)]) + label for label in suffix) + b"\0"
+            probe = data[:2] + b"\x01\0\0\x01" + b"\0" * 6 + name + b"\0\x02\0\x01"
+            self.probes.sendto(probe, self.target)
+            try:
+                response, _ = self.probes.recvfrom(4096)
+            except socket.timeout:
+                self.errors.append("ancestor probe timeout"); return
+            self.probe_count += 1
+            if len(response) < 12 or response[:2] != probe[:2] or response[2] & 0x84 != 0x84:
+                self.errors.append("invalid ancestor response"); return
+            rcode = response[3] & 15
+            if rcode == 3:
+                self.cuts += 1
+                cut = bytearray(data); cut[2] |= 0x80; cut[3] = (cut[3] & 0xf0) | 3
+                self.sock.sendto(cut, self.client)
+                return
+            if rcode != 0 or response[6:10] != b"\0" * 4:
+                self.errors.append("ancestor was not NOERROR/NODATA"); return
+        self.forwarded_txt += 1
+        super().forward(data)
+
+    def close(self):
+        super().close(); self.probes.close()
 
 class Parity(unittest.TestCase):
     @classmethod
@@ -256,9 +304,22 @@ class Parity(unittest.TestCase):
         self.assertIsNone(server.poll())
 
     def test_low_rate_three_streams_idle_to_active(self):
+        self.low_rate_three_streams(Relay)
+
+    def test_qname_minimizing_low_rate_three_streams(self):
+        self.low_rate_three_streams(QNameMinimizingRelay)
+
+    def low_rate_three_streams(self, relay_type):
         b, dns, server = self.server()
-        relay = Relay(dns); self.resources.append(relay)
+        relay = relay_type(dns); self.resources.append(relay)
         child, local = self.client([relay.port])
+        if isinstance(relay, QNameMinimizingRelay):
+            deadline = time.monotonic() + 4
+            while not relay.forwarded_txt and not relay.cuts and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(relay.cuts, 0, "ancestor NXDOMAIN cut original TXT before TLS")
+            self.assertFalse(relay.errors)
+            self.assertGreater(relay.forwarded_txt, 0)
         barrier = threading.Barrier(3, timeout=5)
 
         def transfer(lane):
@@ -285,6 +346,10 @@ class Parity(unittest.TestCase):
         self.assertEqual(len(b.opens), 3)
         self.assertFalse(b.errors)
         self.assertGreater(relay.count, 0)
+        if isinstance(relay, QNameMinimizingRelay):
+            self.assertGreater(relay.probe_count, 0)
+            self.assertEqual(relay.cuts, 0)
+            self.assertFalse(relay.errors)
         self.assertIsNone(child.poll()); self.assertIsNone(server.poll())
 
     def test_server_explicit_bind_and_read_only_reset_seed(self):

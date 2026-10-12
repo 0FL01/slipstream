@@ -31,7 +31,8 @@ ssize_t server_encode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
         txt.name = q->questions[0].name; txt.type = RR_TXT; txt.class = CLASS_IN;
         txt.ttl = 60; txt.text = (char *)src; txt.len = length;
         response.ancount = 1; response.answers = (dns_answer_t *)&txt;
-    } else if (slot->error == RCODE_OKAY) response.rcode = RCODE_NAME_ERROR;
+    } else if (slot->error == RCODE_OKAY && q->questions[0].type == RR_TXT)
+        response.rcode = RCODE_NAME_ERROR;
     dns_answer_t edns = {0};
     edns.opt.name = "."; edns.opt.type = RR_OPT; edns.opt.udp_payload = 1232;
     response.arcount = 1; response.additional = &edns;
@@ -55,7 +56,7 @@ ssize_t server_decode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
     dns_query_t *q = (dns_query_t *)slot->dns_decoded;
     if (!q->query || q->qdcount != 1) return -1;
     slot->error = RCODE_NAME_ERROR;
-    if (q->questions[0].type != RR_TXT) return 0;
+    const bool is_txt = q->questions[0].type == RR_TXT;
     const char *name = q->questions[0].name;
     size_t n = strlen(name);
     if (n && name[n-1] == '.') n--;
@@ -63,7 +64,14 @@ ssize_t server_decode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
     for (size_t i = 0; i < server_domain_count; i++) {
         size_t d = strlen(server_domains[i]);
         if (d && server_domains[i][d-1] == '.') d--;
-        if (n > d + 1 && name[n-d-1] == '.' && !strncasecmp(name + n-d, server_domains[i], d)) {
+        if (((!is_txt && n == d) || (n > d + 1 && name[n-d-1] == '.')) &&
+            !strncasecmp(name + n-d, server_domains[i], d)) {
+            if (!is_txt) {
+                /* RFC9156 probes must not deny ancestors of valid TXT QNames.
+                 * Keep the response slot, without submitting bytes to QUIC. */
+                if (q->questions[0].class == CLASS_IN) slot->error = RCODE_OKAY;
+                return 0;
+            }
             data_len = n - d - 1; break;
         }
     }

@@ -17,10 +17,13 @@ The suites cover:
   unsupported algorithms, missing signature bytes and mismatched leaf DER fail.
 - `server-dns`: actual server decode/encode through SPCDNS wire bytes; in-zone
   IN-class NS/A/AAAA (and other non-TXT) return authoritative NOERROR/NODATA at
-  apex and label-boundary subdomains, with case/trailing-dot variants. Non-IN,
-  outside/impostor names, TXT positive/empty/error and malformed-query behavior,
-  IDs, question echo, addresses and current OPT semantics are checked. A strict
-  RFC9156-style walk must reach a descendant TXT instead of cutting on ancestor
+  apex and label-boundary subdomains, with case/trailing-dot variants. Non-IN non-TXT,
+  outside/impostor names, TXT positive/error and malformed-query behavior,
+  IDs, question echo, addresses and current OPT semantics are checked. Successfully
+  decoded in-zone TXT with no prepared QUIC reply returns NOERROR/NODATA (zero
+  answers, no empty TXT RR), consistent with A/NS existence for the same QName;
+  invalid encoding and outside-zone TXT retain NXDOMAIN and existing class handling.
+  A strict RFC9156-style walk must reach a descendant TXT instead of cutting on ancestor
   NXDOMAIN, while the same descendant is also checked directly.
 - `runtime`: both server suffixes, independent concurrent streams, exact payloads,
   512 KiB upload followed by response after local FIN, remote-first FIN with the

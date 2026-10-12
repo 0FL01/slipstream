@@ -31,8 +31,7 @@ ssize_t server_encode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
         txt.name = q->questions[0].name; txt.type = RR_TXT; txt.class = CLASS_IN;
         txt.ttl = 60; txt.text = (char *)src; txt.len = length;
         response.ancount = 1; response.answers = (dns_answer_t *)&txt;
-    } else if (slot->error == RCODE_OKAY && q->questions[0].type == RR_TXT)
-        response.rcode = RCODE_NAME_ERROR;
+    }
     dns_answer_t edns = {0};
     edns.opt.name = "."; edns.opt.type = RR_OPT; edns.opt.udp_payload = 1232;
     response.arcount = 1; response.additional = &edns;

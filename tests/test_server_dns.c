@@ -103,6 +103,26 @@ static void expect_code(const char *name, dns_type_t type, dns_class_t class,
     }
 }
 
+/* A successfully decoded transport QName exists even without a prepared QUIC
+ * reply. Its empty TXT answer must agree with A/NS existence for the same name. */
+static void valid_empty(void) {
+    const struct { const char *name, *payload; } names[] = {
+        {"NBSWY3DP.t.test", "hello"},
+        {"NBSW.Y3DP.T.TeSt.", "hello"},
+        {"NBSWY3DP.NBSWY3DP.t.test", "hellohello"},
+    };
+    const dns_type_t types[] = {RR_A, RR_NS, RR_TXT};
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+        for (unsigned opt = 0; opt < 2; opt++) {
+            for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++)
+                expect_code(names[n].name, types[t], CLASS_IN,
+                    types[t] == RR_TXT ? names[n].payload : NULL, false, opt != 0, RCODE_OKAY);
+            expect_code(names[n].name, RR_TXT, CLASS_IN,
+                names[n].payload, true, opt != 0, RCODE_OKAY);
+        }
+    }
+}
+
 /* RFC 9156 section 3 (6c)/(6d): NODATA advances to the next label;
  * NXDOMAIN cuts the original descendant lookup without submitting its TXT. */
 static void minimization(dns_type_t type, bool apex) {
@@ -185,12 +205,23 @@ int main(void) {
     }
     expect_code("NBSWY3DP.t.test", RR_TXT, CLASS_IN, "hello", true, false, RCODE_OKAY);
     expect_code("NBSW.Y3DP.T.TeSt.", RR_TXT, CLASS_IN, "hello", true, true, RCODE_OKAY);
-    expect_code("NBSWY3DP.tt.test", RR_TXT, CLASS_IN, "hello", false, true, RCODE_NAME_ERROR);
+    expect_code("NBSWY3DP.tt.test", RR_TXT, CLASS_IN, "hello", false, true, RCODE_OKAY);
+    valid_empty();
     expect_code("t.test", RR_TXT, CLASS_IN, NULL, false, false, RCODE_NAME_ERROR);
     expect_code("invalid!.t.test", RR_TXT, CLASS_IN, NULL, false, false, RCODE_NAME_ERROR);
     expect_code("A.t.test", RR_TXT, CLASS_IN, NULL, false, false, RCODE_NAME_ERROR);
     expect_code("NBSWY3DP.xt.test", RR_TXT, CLASS_IN, NULL, false, false, RCODE_NAME_ERROR);
     expect_code("NBSWY3DP.t.test.invalid", RR_TXT, CLASS_IN, NULL, false, true, RCODE_NAME_ERROR);
+    const dns_class_t classes[] = {CLASS_CH, CLASS_HS};
+    const char *invalid_txt[] = {"t.test", "invalid!.t.test", "A.t.test",
+        "NBSWY3DP.xt.test", "NBSWY3DP.t.test.invalid"};
+    for (size_t c = 0; c < sizeof(classes) / sizeof(classes[0]); c++) {
+        /* Preserve the existing TXT decode's class handling; the non-IN
+         * rejection above is specific to non-TXT questions. */
+        expect_code("NBSWY3DP.t.test", RR_TXT, classes[c], "hello", true, false, RCODE_OKAY);
+        for (size_t n = 0; n < sizeof(invalid_txt) / sizeof(invalid_txt[0]); n++)
+            expect_code(invalid_txt[n], RR_TXT, classes[c], NULL, false, false, RCODE_NAME_ERROR);
+    }
     malformed();
     return failures ? 1 : 0;
 }

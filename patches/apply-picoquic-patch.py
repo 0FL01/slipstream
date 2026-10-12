@@ -10,7 +10,7 @@ def git(patch, *args):
                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 for name in ("picoquic-path-identity.patch", "picoquic-app-credit.patch",
-             "picoquic-poll-ack.patch"):
+             "picoquic-poll-ack.patch", "picoquic-path-ack-context.patch"):
     patch = root / name
     if git(patch, "--reverse", "--check").returncode == 0:
         continue

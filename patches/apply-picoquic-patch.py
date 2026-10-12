@@ -9,7 +9,8 @@ def git(patch, *args):
     return subprocess.run(["git", "-C", str(target), "apply", *args, str(patch)],
                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-for name in ("picoquic-path-identity.patch", "picoquic-app-credit.patch"):
+for name in ("picoquic-path-identity.patch", "picoquic-app-credit.patch",
+             "picoquic-poll-ack.patch"):
     patch = root / name
     if git(patch, "--reverse", "--check").returncode == 0:
         continue

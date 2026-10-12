@@ -162,6 +162,10 @@ poll_submit_test = executable('test-poll-submit',
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('poll-submit', poll_submit_test)
+poll_ack_test = executable('test-poll-ack', files('tests/test_poll_ack.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('poll-ack', poll_ack_test)
 test('runtime', python,
   args: [files('tests/test_runtime.py'), meson.current_build_dir()],
   depends: [client_exe, server_exe], timeout: 120)

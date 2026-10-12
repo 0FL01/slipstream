@@ -1,0 +1,11 @@
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -3534,7 +3534,6 @@
+                     p->send_path->last_time_acked_data_frame_sent = current_time;
+                 }
+             }
+-            picoquic_record_ack_packet_data(packet_data, p);
+             byte_index += l_ftype;
+             break;
+         default:

@@ -19,6 +19,7 @@ static struct {
     size_t length;
     int prepare_result, encode_result, send_result;
     unsigned callbacks, next_calls, poll_calls, encode_calls, send_calls, frees;
+    uint64_t elapsed;
     unsigned char *owned;
 } f;
 
@@ -29,7 +30,8 @@ static struct {
     } \
 } while (0)
 
-static uint64_t test_time(void) { return 10000000; }
+static const uint64_t batch_time = 10000000;
+static uint64_t test_time(void) { return batch_time + f.elapsed; }
 
 static int64_t test_wake_delay(picoquic_quic_t *quic, uint64_t now, int64_t maximum) {
     CHECK(quic == &f.quic && now == test_time() && maximum > 0);
@@ -73,6 +75,7 @@ static int test_prepare_next(picoquic_quic_t *quic, uint64_t now,
     CHECK(f.cnx.is_poll_requested == 0);
     *cnx = &f.cnx;
     if (++f.next_calls > 1 || f.poll) {
+        if (f.poll) f.elapsed += 1000; /* Time spent preparing an empty data attempt. */
         *length = 0;
         return 0;
     }
@@ -90,7 +93,7 @@ static int test_prepare_poll(picoquic_cnx_t *cnx, int path_id, uint64_t now,
 }
 
 static size_t test_poll_budget(ss_conn *connection, int path_id, uint64_t now) {
-    CHECK(connection == &f.app.head && path_id == 0 && now == test_time());
+    CHECK(connection == &f.app.head && path_id == 0 && now == batch_time);
     return f.poll ? 1 : 0;
 }
 
@@ -104,6 +107,7 @@ static ssize_t test_encode(void *slot_ctx, void *app, unsigned char **encoded,
     CHECK(to->ss_family == AF_INET && from->ss_family == AF_INET);
     for (size_t i = 0; i < length; i++) CHECK(buffer[i] == 0x5a);
     CHECK(++f.encode_calls == 1 && f.owned == NULL);
+    f.elapsed += 1000; /* Encoding/submission time must reach the next prepare. */
     if (f.allocate) {
         f.owned = malloc(16);
         CHECK(f.owned != NULL);
@@ -185,9 +189,9 @@ static void run_case(const char *name, bool poll, bool clear_request, size_t len
     CHECK(f.send_calls == (submitted ? 1U : 0U));
     CHECK(f.frees == (encoded && allocate ? 1U : 0U) && f.owned == NULL);
     CHECK(f.callbacks == (failed ? 1U : 2U));
-    uint64_t deadline = test_time();
+    uint64_t deadline = batch_time;
     if (poll && !failed && (phase == SS_WARM || phase == SS_QUIET))
-        deadline = ss_sparse_poll_deadline(phase, test_time(), submitted);
+        deadline = ss_sparse_poll_deadline(phase, batch_time, submitted);
     CHECK(f.app.head.next_poll == deadline);
 }
 

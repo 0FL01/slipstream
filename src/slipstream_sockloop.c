@@ -206,12 +206,14 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
                     /* Resolve identity again: previous reply preparation can delete paths. */
                     slot->path_id = picoquic_get_path_id_from_unique(slot->cnx, slot->unique_path_id);
                     if (slot->path_id < 0) continue;
-                    ret = picoquic_prepare_packet_ex(slot->cnx, slot->path_id, loop_time,
+                    /* Earlier replies can consume pacing credit and real time.
+                     * Prepare against the same clock now, not the batch start. */
+                    ret = picoquic_prepare_packet_ex(slot->cnx, slot->path_id, picoquic_current_time(),
                         send_buffer, send_buffer_size, &send_length,
                         &peer_addr, &local_addr, &if_index, send_msg_ptr);
                 }
                 else if (param->is_client) {
-                    ret = picoquic_prepare_next_packet_ex(quic, loop_time,
+                    ret = picoquic_prepare_next_packet_ex(quic, picoquic_current_time(),
                         send_buffer, send_buffer_size, &send_length,
                         &peer_addr, &local_addr, &if_index, &log_cid, &slot->cnx,
                         send_msg_ptr);
@@ -294,7 +296,7 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             struct sockaddr_storage peer_addr = {0};
             struct sockaddr_storage local_addr = {0};
             int if_index = param->dest_if;
-            int ret = picoquic_prepare_packet_ex(slot->cnx, path_id, loop_time,
+            int ret = picoquic_prepare_packet_ex(slot->cnx, path_id, picoquic_current_time(),
                 send_buffer, send_buffer_size, &send_length,
                 &peer_addr, &local_addr, &if_index, send_msg_ptr);
             /* This request belongs to this prepare call. A finalized data/ACK

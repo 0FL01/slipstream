@@ -12,6 +12,10 @@ The suites cover:
   writes with delayed FIN, sparse-poll retry deadlines and the Warm transition.
 - `path-guard`: invalid forced-path indices, missing remote CID, path compaction,
   and deletion of the requested path against the actual patched picoquic.
+- `poll-submit`: production-loop packet submission/error/cleanup cases. A scripted
+  native clock advances during the empty regular attempt and encoding; subsequent
+  regular/POLL prepares must see that elapsed time, while existing batch-based
+  poll budgets and sparse deadlines remain unchanged. This is not a pacing benchmark.
 - `pin`: the actual certificate/signature callbacks with valid RSA-PSS,
   RSA-PKCS1, EC and Ed25519 signatures; tampered signatures, changed transcripts,
   unsupported algorithms, missing signature bytes and mismatched leaf DER fail.

@@ -1,0 +1,23 @@
+diff --git a/picoquic/loss_recovery.c b/picoquic/loss_recovery.c
+--- a/picoquic/loss_recovery.c
++++ b/picoquic/loss_recovery.c
+@@ -582,11 +582,16 @@
+-        /* Find the last packet in the queue, which may be this one.
+-        * Compute a timer from the time this last packet was sent.
++        /* Find the last ACK-eliciting packet in the existing packet context.
++        * ACK/POLL-only packets and unsent ACK traps must not postpone PTO.
++        * Compute a timer from the time this last packet was sent.
+         * If the timer has elapsed, this packet should be resent,
+         * in a timer based manner. If not, set the timer to
+         * the specified value. */
+         uint64_t retransmit_time_timer;
+         picoquic_packet_t* last_packet = picoquic_get_last_packet(cnx, old_p->send_path, old_p->pc);
+-
++
++        while (last_packet != NULL && !picoquic_is_packet_ack_eliciting(last_packet)) {
++            last_packet = last_packet->packet_previous;
++        }
++
+         if (last_packet == NULL) {
+             last_packet = old_p;
+         }

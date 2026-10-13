@@ -15,6 +15,11 @@ The suites cover:
 - `pin`: the actual certificate/signature callbacks with valid RSA-PSS,
   RSA-PKCS1, EC and Ed25519 signatures; tampered signatures, changed transcripts,
   unsupported algorithms, missing signature bytes and mismatched leaf DER fail.
+- `stream-ack-ranges`: serialized STREAMs through the production packet ACK
+  walker/STREAM ACK handler and retransmission classifier. Empty non-FIN frames
+  at zero, positive and maximum offsets are consumed without adding byte ACKs;
+  sparse ranges, duplicates, adjacency, FIN markers, data+FIN, implicit/explicit
+  lengths, the 62-bit end boundary and malformed/truncated headers are checked.
 - `server-dns`: actual server decode/encode through SPCDNS wire bytes; in-zone
   IN-class NS/A/AAAA (and other non-TXT) return authoritative NOERROR/NODATA at
   apex and label-boundary subdomains, with case/trailing-dot variants. Non-IN non-TXT,
@@ -78,3 +83,39 @@ requests; excess requests are dropped and counted. This is a synthetic UDP
 fixture, not a real recursive resolver or the main TCP-DNS adapter. An optional
 `--baseline-build <immutable-build-dir>` measures C0 with a raw FlowRelay OPEN;
 C0 diagnostic output is discarded, while candidate output remains a strict gate.
+
+## STREAM ACK range regression
+
+The tracked `picoquic-stream-ack-range.patch` leaves valid empty non-FIN STREAMs
+as no-ops after parsing/consumption. It rejects an end offset above `2^62-1`
+with the existing `-1` result before SACK or stream-lifetime mutation. Nonempty
+data keeps inclusive byte ranges; FIN keeps its inclusive end-offset marker.
+
+The native reproducer first ACKs `[0,4)` and `[5,8)` and verifies that byte 4
+still needs retransmission. Empty non-FIN at offset 5 is a preservation control:
+it already leaves this particular hole intact before the fix. Empty at offset 0
+was the suppression reproducer: its inclusive end underflowed to `UINT64_MAX`,
+merged the ranges and made the production classifier skip byte 4. On a fresh
+stream, positive-offset empty frames also created an invalid inverted range.
+The unpatched handler accepted out-of-domain ends. These are ACK bookkeeping
+regressions, not evidence of an empty-frame occurrence or a device outage.
+The normal queued/active `picoquic_format_stream_frame` producer drops zero-length
+non-FIN output; its inspection does not establish a live occurrence.
+
+Run the narrow gate and all native gates on an isolated source export:
+
+```sh
+# For an archive export inside another Git repository, isolate git-apply paths.
+git -C <exported-source-dir>/subprojects/picoquic init --template=
+meson setup <build-dir> <exported-source-dir>
+meson test -C <build-dir> stream-ack-ranges --print-errorlogs
+meson test -C <build-dir> --print-errorlogs
+meson setup <sanitizer-build-dir> <exported-source-dir> --buildtype=debug \
+  -Db_sanitize=address,undefined -Ddefault_library=static
+meson test -C <sanitizer-build-dir> stream-ack-ranges --print-errorlogs
+```
+
+The regression uses only synthetic in-memory frames and loopback connection
+addresses. Configure applies all tracked patches only to that export; no raw
+dependency checkout needs editing. This gate does not change transport pins,
+TLS/pinning, media, congestion control, recovery policy or scheduler thresholds.

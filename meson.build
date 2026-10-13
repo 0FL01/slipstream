@@ -174,6 +174,10 @@ pto_ack_anchor_test = executable('test-pto-ack-anchor', files('tests/test_pto_ac
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('pto-ack-anchor', pto_ack_anchor_test)
+stream_ack_ranges_test = executable('test-stream-ack-ranges', files('tests/test_stream_ack_ranges.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('stream-ack-ranges', stream_ack_ranges_test)
 server_dns_test = executable('test-server-dns',
   files('tests/test_server_dns.c', src / 'slipstream_server.c',
     src / 'slipstream_inline_dots.c', src / 'slipstream_utils.c',

@@ -11,7 +11,7 @@ def git(patch, *args):
 
 for name in ("picoquic-path-identity.patch", "picoquic-app-credit.patch",
              "picoquic-poll-ack.patch", "picoquic-path-ack-context.patch",
-             "picoquic-pto-ack-anchor.patch"):
+             "picoquic-pto-ack-anchor.patch", "picoquic-stream-ack-range.patch"):
     patch = root / name
     if git(patch, "--reverse", "--check").returncode == 0:
         continue

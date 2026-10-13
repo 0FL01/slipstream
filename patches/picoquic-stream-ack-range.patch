@@ -1,0 +1,20 @@
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -3410,6 +3410,16 @@ int picoquic_process_ack_of_stream_frame(picoquic_cnx_t* cnx, uint8_t* bytes,
+     if (ret == 0) {
+         *consumed += data_length;
+ 
++        /* Validate the QUIC end offset before changing stream ACK state. */
++        if (data_length > ((1ull << 62) - 1) - offset) {
++            return -1;
++        }
++
++        /* An empty non-FIN STREAM is valid, but acknowledges no bytes. */
++        if (data_length == 0 && !fin) {
++            return 0;
++        }
++
+         /* record the ack range for the stream */
+         stream = picoquic_find_stream(cnx, stream_id);
+         if (stream != NULL) {

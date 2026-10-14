@@ -1,0 +1,13 @@
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -6303,6 +6303,9 @@
+             case picoquic_frame_type_poll:
+                 bytes = picoquic_skip_0len_frame(bytes, bytes_max);
++                /* POLL asks for a response; allow its DNS slot to carry an ACK.
++                 * Keep sender/PTO classification and normal ACK delay intact. */
++                ack_needed = 1;
+                 break;
+             case picoquic_frame_type_data_blocked:
+                 bytes = picoquic_decode_blocked_frame(cnx, bytes, bytes_max);
+                 ack_needed = 1;

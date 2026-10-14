@@ -349,7 +349,8 @@ static unsigned ready_frames(picoquic_packet_t *packet, unsigned *acks,
     return streams;
 }
 
-enum ack_slot_case { no_ack, coalesce_ack, fresh_data, no_room, forced_no_room, cwin_blocked };
+enum ack_slot_case { no_ack, coalesce_ack, fresh_data, no_room, forced_no_room, cwin_blocked,
+    no_room_future, no_room_due };
 
 static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
     uint64_t now = 1000000;
@@ -359,7 +360,8 @@ static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
     size_t header = picoquic_predict_packet_header_length(cnx,
         picoquic_packet_1rtt_protected, ctx);
     uint8_t data[128], original_bytes[128]; memset(data, 0x36, sizeof(data));
-    int large = test == no_room || test == forced_no_room;
+    int large = test == no_room || test == forced_no_room || test == no_room_future ||
+        test == no_room_due;
     size_t data_length = large ? path->send_mtu - header - 16 - 4 : 45;
     assert(data_length > 0 && data_length < sizeof(data));
     assert(picoquic_add_to_stream(cnx, 0, data, data_length, 0) == 0);
@@ -369,7 +371,18 @@ static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
     assert(original->length <= sizeof(original_bytes));
     memcpy(original_bytes, original->bytes, original->length);
     uint64_t original_time = original->send_time, original_number = original->sequence_number;
+    picoquic_packet_t *future = NULL;
+    if (test == no_room_future || test == no_room_due) {
+        /* A later pending packet must not hide an already-due copy when only
+         * the ACK's remaining buffer is too small. Its own repeat is not due. */
+        assert(picoquic_add_to_stream(cnx, 0, data, 45, 0) == 0);
+        future = prepare_ready(cnx, now + 1000);
+        unsigned acks = 0;
+        assert(future && ready_frames(future, &acks, data, 45, data_length) == 1 && !acks);
+        assert(!future->was_preemptively_repeated && cnx->nb_preemptive_repeat == 0);
+    }
     now += (rtt == 140000 ? rtt / 4 : PICOQUIC_ACK_DELAY_MAX) + 1;
+    if (test == no_room_due) now += 1000;
     if (test != no_ack) {
         assert(picoquic_record_pn_received(cnx, application,
             path->p_local_cnxid, 0, now) == 0);
@@ -386,10 +399,21 @@ static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
     assert(original->send_time == original_time && original->sequence_number == original_number);
     assert(memcmp(original->bytes, original_bytes, original->length) == 0);
     unsigned acks = 0;
-    unsigned streams = ready_frames(packet, &acks, data, data_length,
-        test == fresh_data ? data_length : 0);
+    unsigned streams = ready_frames(packet, &acks, data,
+        test == no_room_due ? 45 : data_length,
+        test == fresh_data || test == no_room_due ? data_length : 0);
     assert(acks == (unsigned)(test != no_ack));
-    if (large || test == cwin_blocked) {
+    if (test == no_room_due) {
+        /* A deferred large packet must not prevent a later fitting copy from
+         * using this ACK slot, nor be forgotten after that successful copy. */
+        assert(streams == 1 && !original->was_preemptively_repeated &&
+            future->was_preemptively_repeated && packet->is_preemptive_repeat &&
+            cnx->nb_preemptive_repeat == 1);
+        packet = prepare_ready(cnx, now + 1);
+        assert(packet && ready_frames(packet, &acks, data, data_length, 0) == 1 && !acks);
+        assert(original->was_preemptively_repeated && packet->is_preemptive_repeat &&
+            cnx->nb_preemptive_repeat == 2);
+    } else if (large || test == cwin_blocked) {
         /* A failed fit is not a copy. An ACK-only packet must not acquire the
          * copy flag, and forced-probe fallback must not append a PING here. */
         assert(!streams && !original->was_preemptively_repeated &&
@@ -399,6 +423,7 @@ static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
             assert(packet && ready_frames(packet, &acks, data, data_length, 0) == 1 && !acks);
             assert(original->was_preemptively_repeated && packet->is_preemptive_repeat);
             assert(cnx->nb_preemptive_repeat == 1);
+            assert(!future || !future->was_preemptively_repeated);
         }
     } else if (test == fresh_data) {
         assert(streams == 1 && !original->was_preemptively_repeated &&
@@ -426,7 +451,7 @@ int main(void) {
     low_rtt_window(200000);
     for (int multipath = 0; multipath <= 1; multipath++) {
         for (int low = 0; low <= 1; low++) {
-            for (int test = no_ack; test <= cwin_blocked; test++)
+            for (int test = no_ack; test <= no_room_due; test++)
                 ack_slot(multipath, low ? 140000 : 240000, (enum ack_slot_case)test);
         }
     }

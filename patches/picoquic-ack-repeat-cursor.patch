@@ -1,0 +1,59 @@
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -1255,7 +1255,8 @@
+     uint8_t* new_bytes,
+     size_t send_buffer_max_minus_checksum,
+     size_t* length,
+-    int * has_data)
++    int * has_data,
++    int * deferred)
+ {
+     /* check if this is an ACK only packet */
+     int ret = 0;
+@@ -1323,6 +1324,8 @@
+             old_p->was_preemptively_repeated = 1;
+         }
+     }
++    /* ACK coalescing can leave too little room for eligible frames. */
++    *deferred = is_preemptive_needed && !is_repeated;
+
+     return ret;
+ }
+@@ -1345,6 +1348,7 @@
+      * that context. If there are multiple paths, we need to consider
+      * packets from every plausible path.
+      */
+     int ret = 0;
++    picoquic_packet_t* first_deferred_repeat = NULL;
+
+     /* Check that the connection is still active before adding more preemptive repeats */
+@@ -1387,11 +1391,15 @@
+                 *more_data = 1;
+                 break;
+             }
++            int deferred = 0;
+             ret = picoquic_preemptive_retransmit_packet(pkt_ctx->preemptive_repeat_ptr, cnx,
+-                new_bytes, send_buffer_max_minus_checksum, length, has_data);
++                new_bytes, send_buffer_max_minus_checksum, length, has_data, &deferred);
+             if (ret != 0) {
+                 break;
+             }
++            if (deferred && first_deferred_repeat == NULL) {
++                first_deferred_repeat = pkt_ctx->preemptive_repeat_ptr;
++            }
+         }
+         pkt_ctx->preemptive_repeat_ptr = pkt_ctx->preemptive_repeat_ptr->packet_next;
+         if (*has_data) {
+@@ -1402,5 +1410,11 @@
+             break;
+         }
+     }
++    if (ret == 0 && first_deferred_repeat != NULL) {
++        /* A smaller ACK buffer must not hide an older due copy behind a
++         * newer packet whose repeat time has not arrived yet. */
++        pkt_ctx->preemptive_repeat_ptr = first_deferred_repeat;
++        *more_data = 1;
++    }
+     return ret;
+ }

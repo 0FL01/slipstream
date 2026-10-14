@@ -439,6 +439,29 @@ static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
     picoquic_free(cnx->quic);
 }
 
+static void copied_stream_recovery(int multipath) {
+    uint64_t now = 1000000;
+    picoquic_cnx_t *cnx = ready_sender(&now, multipath, 140000);
+    const uint8_t data[45] = {1, 2, 3};
+    assert(!picoquic_add_to_stream(cnx, 0, data, sizeof(data), 0));
+    picoquic_packet_t *original = prepare_ready(cnx, now); assert(original);
+    picoquic_packet_t *copy = prepare_ready(cnx, now + 35001); unsigned acks = 0;
+    assert(copy && copy->is_preemptive_repeat && original->was_preemptively_repeated);
+    assert(ready_frames(copy, &acks, data, sizeof(data), 0) == 1 && !acks);
+    assert(!prepare_ready(cnx, now + 70002) && cnx->nb_preemptive_repeat == 1);
+    now += 70002 + 2 * cnx->path[0]->retransmit_timer;
+    picoquic_packet_t *scratch = picoquic_create_packet(cnx->quic); assert(scratch);
+    size_t header = 0; uint64_t wake = UINT64_MAX;
+    assert(picoquic_retransmit_needed(cnx, application, cnx->path[0], now, &wake,
+        scratch, 143, &header) == 0 && picoquic_first_data_repeat_packet(cnx));
+    picoquic_recycle_packet(cnx->quic, scratch);
+    picoquic_packet_t *repair = prepare_ready(cnx, now + 1);
+    assert(repair && !repair->is_preemptive_repeat);
+    assert(ready_frames(repair, &acks, data, sizeof(data), 0) == 1 && !acks);
+    fprintf(stderr, "POLICY bounded-copy ordinary recovery mp=%d checked\n", multipath);
+    picoquic_free(cnx->quic);
+}
+
 int main(void) {
     early_copy(1, 0);
     early_copy(1, 1); /* Empty FIN retains the baseline eligibility. */
@@ -454,6 +477,7 @@ int main(void) {
     };
     for (size_t i = 0; i < sizeof(windows) / sizeof(windows[0]); i++)
         repeat_window(windows[i].rtt, windows[i].delay);
+    copied_stream_recovery(0); copied_stream_recovery(1);
     const uint64_t ready_rtts[] = {140000, 200580, 240000, 399999};
     for (int multipath = 0; multipath <= 1; multipath++) {
         for (size_t i = 0; i < sizeof(ready_rtts) / sizeof(ready_rtts[0]); i++) {

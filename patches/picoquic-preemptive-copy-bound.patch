@@ -1,0 +1,11 @@
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -1273,5 +1273,6 @@
+-    if (!old_p->is_mtu_probe &&
++    if (!old_p->is_preemptive_repeat &&
++        !old_p->is_mtu_probe &&
+         !old_p->is_ack_trap &&
+         !old_p->is_multipath_probe) {
+         /* Copy the relevant bytes from one packet to the next */
+         byte_index = old_p->offset;

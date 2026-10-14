@@ -84,9 +84,10 @@ static picoquic_packet_t *prepare(ss_conn *c, uint64_t now, bool poll) {
     return packet;
 }
 
-static void interleave(bool client, int multipath) {
+static void interleave(bool client, int multipath, bool revisit_copy) {
     uint64_t now = 1000000; ss_conn c; int peer = setup(&c, &now, client, multipath);
     picoquic_cnx_t *cnx = c.cnx; picoquic_path_t *path = cnx->path[0];
+    if (revisit_copy) path->cwin = 686;
     const uint8_t old[45] = {1, 2, 3};
     assert(picoquic_add_to_stream(cnx, 0, old, sizeof(old), 0) == 0);
     picoquic_packet_t *original = prepare(&c, now, false); assert(original);
@@ -100,14 +101,21 @@ static void interleave(bool client, int multipath) {
     assert(path->cwin - path->bytes_in_transit >= 2 * path->send_mtu);
     picoquic_packet_t *copy = prepare(&c, now + 35001, false);
     assert(copy && copy->is_preemptive_repeat && original->was_preemptively_repeated);
+    uint64_t copies = cnx->nb_preemptive_repeat;
+    picoquic_packet_t *nested = NULL;
+    if (revisit_copy) nested = prepare(&c, now + 70002, false);
     picoquic_stream_head_t *stream = picoquic_find_stream(cnx, 0);
     uint64_t before = stream->sent_offset; const uint8_t fresh[132] = {4, 5, 6};
     assert(picoquic_add_to_stream(cnx, 0, fresh, sizeof(fresh), 0) == 0);
     for (unsigned tries = 0; tries < 4 && stream->send_queue; tries++) {
-        picoquic_packet_t *packet = prepare(&c, now + 40000 + tries, false);
+        picoquic_packet_t *packet = prepare(&c, now + (revisit_copy ? 80000 : 40000) + tries, false);
         assert(packet && !packet->is_preemptive_repeat);
     }
     assert(stream->sent_offset - before == sizeof(fresh) && !stream->send_queue);
+    if (revisit_copy) {
+        assert(!nested && cnx->nb_preemptive_repeat == copies);
+        fprintf(stderr, "POLL_CREDIT bounded early copy client=%d mp=%d fresh=132\n", client, multipath);
+    }
     cleanup(&c, peer);
 }
 
@@ -195,7 +203,8 @@ static void small_window_response(int multipath) {
 
 int main(void) {
     for (int client = 0; client < 2; client++) {
-        interleave(client != 0, 0); interleave(client != 0, 1);
+        interleave(client != 0, 0, false); interleave(client != 0, 1, false);
+        interleave(client != 0, 0, true); interleave(client != 0, 1, true);
         edges(client != 0);
     }
     small_window_response(0); small_window_response(1);

@@ -231,6 +231,45 @@ static void suppressed(enum suppression reason) {
     picoquic_free(cnx->quic);
 }
 
+static void low_rtt_window(uint64_t rtt) {
+    uint64_t now = 1000000;
+    picoquic_cnx_t *cnx = connection(&now, 1);
+    cnx->path[0]->smoothed_rtt = rtt;
+    uint8_t frame[64], copy[64];
+    assert(picoquic_add_to_stream(cnx, 0, payload, sizeof(payload), 0) == 0);
+    size_t frame_length = stream_frame(cnx, frame, sizeof(frame));
+    picoquic_packet_t *packet = pending(cnx, frame, frame_length, now);
+    uint64_t inflight = cnx->path[0]->bytes_in_transit;
+    uint64_t delay = rtt / 4, wake = UINT64_MAX;
+    size_t length = 0;
+    /* The old 100ms floor was at or beyond the rtt/2 exclusion boundary.
+     * Enabled early repeat must have a usable interval, not one exact tick. */
+    assert(delay < rtt / 2);
+    assert(!repeat(cnx, now + delay - 1, copy, sizeof(copy), &length, &wake));
+    assert(length == 0 && wake == now + delay && !packet->was_preemptively_repeated);
+    assert(repeat(cnx, now + delay + 1, copy, sizeof(copy), &length, &wake));
+    assert(length == frame_length && memcmp(copy, frame, frame_length) == 0);
+    size_t copy_length = length;
+    assert(packet->was_preemptively_repeated && cnx->nb_preemptive_repeat == 1);
+    assert(cnx->pkt_ctx[application].pending_first == packet &&
+        cnx->pkt_ctx[application].pending_last == packet);
+    assert(cnx->path[0]->bytes_in_transit == inflight);
+    assert(!repeat(cnx, now + delay + 2, copy, sizeof(copy), &length, &wake));
+    assert(length == 0 && cnx->nb_preemptive_repeat == 1);
+
+    struct received received = {0};
+    picoquic_cnx_t *peer = connection(&now, 0);
+    picoquic_set_callback(peer, receive_bytes, &received);
+    decode(peer, copy, copy_length, now + delay + 1);
+    decode(peer, packet->bytes + packet->offset, frame_length, now + delay + 2);
+    assert(received.length == sizeof(payload) && received.fins == 0);
+    assert(memcmp(received.bytes, payload, sizeof(payload)) == 0);
+    fprintf(stderr, "POLICY low RTT=%llu us: early=%llu us, one copy, peer bytes once\n",
+        (unsigned long long)rtt, (unsigned long long)delay);
+    picoquic_free(peer->quic);
+    picoquic_free(cnx->quic);
+}
+
 int main(void) {
     early_copy(1, 0);
     early_copy(1, 1); /* Empty FIN retains the baseline eligibility. */
@@ -238,5 +277,9 @@ int main(void) {
     fputs("POLICY controls: FIN, ACKed, reset, destroyed, zero-data, peer duplicate PASS\n", stderr);
     early_copy(0, 0);
     fputs("POLICY open-data early copy: PASS (one copy, pending retained, peer bytes once)\n", stderr);
+    low_rtt_window(40000);
+    low_rtt_window(100000);
+    low_rtt_window(140000);
+    low_rtt_window(200000);
     return 0;
 }

@@ -183,8 +183,13 @@ void ss_conn_service(ss_conn *c, uint64_t now) {
                     else picoquic_find_stream(c->cnx, s->id)->app_flow_control = 1;
                 }
                 struct pollfd p = {s->fd, POLLIN, 0};
-                if (!s->failed && poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR)))
+                int readable = poll(&p, 1, 0);
+                if (!s->failed && readable > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR)))
                     picoquic_mark_active_stream(c->cnx, s->id, 1, s);
+                else if (!s->failed && readable == 0)
+                    /* A positive prepare callback kept this producer active.
+                     * Once drained, it must not suppress DNS pulls or POLLIN. */
+                    picoquic_mark_active_stream(c->cnx, s->id, 0, s);
             }
         }
         if (s->failed || (s->local_fin && s->remote_fin && s->write_closed && !s->out_len))

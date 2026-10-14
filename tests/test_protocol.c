@@ -144,4 +144,82 @@ static void partial_output(void) {
     close(fds[1]); free(data); free(received); picoquic_free(quic);
 }
 
-int main(void) { credentials(); framing(); scheduler(); receive_credit(); partial_output(); return 0; }
+static int active_callback(picoquic_cnx_t *cnx, uint64_t id, uint8_t *bytes,
+    size_t length, picoquic_call_back_event_t event, void *ctx, void *stream_ctx) {
+    (void)cnx;
+    return ss_stream_event(ctx, id, bytes, length, event, stream_ctx);
+}
+
+static size_t format_active(ss_conn *c, picoquic_stream_head_t *stream, size_t capacity) {
+    uint8_t bytes[128];
+    assert(capacity <= sizeof(bytes));
+    int more = 0, pure_ack = 1, active = 0, ret = 0;
+    uint64_t before = stream->sent_offset;
+    assert(picoquic_format_stream_frame(c->cnx, stream, bytes, bytes + capacity,
+        &more, &pure_ack, &active, &ret) != NULL && ret == 0);
+    return (size_t)(stream->sent_offset - before);
+}
+
+static void active_readiness(bool client) {
+    uint64_t now = picoquic_current_time();
+    picoquic_quic_config_t config; picoquic_config_init(&config);
+    config.nb_connections = 1; config.alpn = "test"; config.enable_sslkeylog = 0;
+    picoquic_quic_t *quic = picoquic_create_and_configure(&config, NULL, NULL, now, NULL);
+    assert(quic);
+    struct sockaddr_in addr = {0}; addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(53);
+    ss_conn c = {0}; c.client = client; c.ready = true; c.last_activity = now;
+    c.cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
+        (struct sockaddr *)&addr, now, 0, "test", "test", 1);
+    assert(c.cnx);
+    c.cnx->cnx_state = picoquic_state_ready;
+    c.cnx->max_stream_id_bidir_remote = 64; c.cnx->maxdata_remote = SS_BUFFER_LIMIT;
+    picoquic_set_callback(c.cnx, active_callback, &c);
+    int fds[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    assert(ss_nonblock(fds[0]) == 0 && ss_nonblock(fds[1]) == 0);
+    ss_stream *s = ss_stream_create(&c, fds[0], 0); assert(s); s->connected = true;
+    assert(picoquic_set_app_stream_ctx(c.cnx, 0, s) == 0);
+    picoquic_stream_head_t *stream = picoquic_find_stream(c.cnx, 0); assert(stream);
+    stream->maxdata_remote = SS_BUFFER_LIMIT;
+    picoquic_path_t *path = c.cnx->path[0]; assert(path->p_remote_cnxid);
+    path->challenge_verified = 1; path->send_mtu = 143;
+    path->cwin = 1430; path->pacing.rate = 0; path->bytes_in_transit = 0;
+    const uint8_t data[32] = {1, 2, 3};
+    assert(send(fds[1], data, 6, 0) == 6);
+    ss_conn_service(&c, now);
+    assert(stream->is_active && picoquic_find_ready_stream(c.cnx) == stream);
+    assert(format_active(&c, stream, 128) == 6);
+    assert(stream->is_active); /* Real positive callback optimistically kept it active. */
+    assert(ss_conn_poll_budget(&c, 0, now) == 0);
+    ss_conn_service(&c, now);
+    assert(!stream->is_active && picoquic_find_ready_stream(c.cnx) == NULL);
+    assert(ss_conn_poll_budget(&c, 0, now) > 0);
+
+    /* A later write must wake the same owner, and a partial drain stays active. */
+    assert(send(fds[1], data, sizeof(data), 0) == sizeof(data));
+    ss_loop loop = {0}; loop.head = c; loop.head.client = true; loop.listener = -1;
+    int udp = socket(AF_INET, SOCK_DGRAM, 0); assert(udp >= 0);
+    assert(ss_runtime_wait(&loop, udp, 50000) > 0);
+    ss_conn_service(&c, now);
+    size_t first = format_active(&c, stream, 16);
+    assert(first > 0 && first < sizeof(data));
+    ss_conn_service(&c, now); assert(stream->is_active);
+    assert(format_active(&c, stream, 128) == sizeof(data) - first);
+    ss_conn_service(&c, now); assert(!stream->is_active);
+
+    /* Raw-socket readiness must not remove already queued QUIC bytes. */
+    assert(picoquic_add_to_stream_with_ctx(c.cnx, 0, data, 3, 0, s) == 0);
+    ss_conn_service(&c, now);
+    assert(!stream->is_active && stream->send_queue && picoquic_find_ready_stream(c.cnx) == stream);
+    assert(format_active(&c, stream, 128) == 3);
+    assert(shutdown(fds[1], SHUT_WR) == 0);
+    ss_conn_service(&c, now); assert(stream->is_active);
+    assert(format_active(&c, stream, 128) == 0 && s->local_fin && stream->fin_sent);
+    ss_conn_clear(&c); close(fds[1]); close(udp); picoquic_free(quic);
+}
+
+int main(void) {
+    credentials(); framing(); scheduler(); receive_credit(); partial_output();
+    active_readiness(false); active_readiness(true);
+    return 0;
+}

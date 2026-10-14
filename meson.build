@@ -149,6 +149,11 @@ protocol_test = executable('test-protocol',
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('protocol', protocol_test)
+poll_credit_test = executable('test-poll-credit',
+  files('tests/test_poll_credit.c', src / 'slipstream_flow.c', src / 'slipstream_bridge.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('poll-credit', poll_credit_test)
 path_test = executable('test-path-guard', files('tests/test_path_guard.c'),
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])

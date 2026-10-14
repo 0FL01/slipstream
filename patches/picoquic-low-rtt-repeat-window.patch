@@ -7,7 +7,7 @@ diff --git a/picoquic/sender.c b/picoquic/sender.c
          uint64_t early_delay = (rtt > 8 * PICOQUIC_ACK_DELAY_MAX) ? rtt / 8 : PICOQUIC_ACK_DELAY_MAX;
 +        /* Keep a usable interval before the rtt/2 exclusion boundary.
 +         * Unknown or tiny RTTs retain the existing ACK-delay floor. */
-+        if (rtt >= 4 && early_delay >= rtt / 2) {
++        if (rtt >= 4 && early_delay > rtt / 4) {
 +            early_delay = rtt / 4;
 +        }
          uint64_t early_time = pkt_ctx->preemptive_repeat_ptr->send_time + early_delay;

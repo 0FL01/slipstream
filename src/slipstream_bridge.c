@@ -266,5 +266,13 @@ size_t ss_conn_poll_budget(ss_conn *c, int path_id, uint64_t now) {
     size_t wanted = target > 64 ? 64 : (size_t)target;
     size_t budget = ss_poll_budget(phase, wanted > inflight ? wanted - inflight : 0,
                                    now >= c->next_poll, ready, blocked);
+    /* Leave a minimum data flight for fresh bytes and an early repair.
+     * Small congestion windows must still admit one acknowledged pull. */
+    uint64_t window_packets = p->cwin / mtu;
+    uint64_t reserve = window_packets > 2 ? 2 : (window_packets > 0 ? window_packets - 1 : 0);
+    uint64_t credit = p->cwin > p->bytes_in_transit ? p->cwin - p->bytes_in_transit : 0;
+    uint64_t packets = credit / mtu;
+    uint64_t poll_cap = packets > reserve ? packets - reserve : 0;
+    if (budget > poll_cap) budget = (size_t)poll_cap;
     return budget > 16 ? 16 : budget;
 }

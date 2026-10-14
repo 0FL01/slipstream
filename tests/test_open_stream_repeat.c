@@ -143,8 +143,8 @@ static void early_copy(int fin, int empty) {
     picoquic_packet_context_t *ctx = &cnx->pkt_ctx[application];
     uint64_t inflight = cnx->path[0]->bytes_in_transit;
     uint64_t rtt = cnx->path[0]->smoothed_rtt;
-    uint64_t early_delay = rtt > 8 * PICOQUIC_ACK_DELAY_MAX ? rtt / 8 : PICOQUIC_ACK_DELAY_MAX;
-    assert(early_delay <= rtt / 2);
+    assert(rtt == 240000);
+    uint64_t early_delay = 60000; /* Retain a full quarter-RTT selection interval. */
     uint64_t early_time = now + early_delay, wake = 0; size_t length = 0;
     assert(!repeat(cnx, early_time - 1, copy, sizeof(copy), &length, &wake));
     assert(length == 0 && wake == early_time && !packet->was_preemptively_repeated);
@@ -242,7 +242,7 @@ static void suppressed(enum suppression reason) {
     picoquic_free(cnx->quic);
 }
 
-static void low_rtt_window(uint64_t rtt) {
+static void repeat_window(uint64_t rtt, uint64_t delay) {
     uint64_t now = 1000000;
     picoquic_cnx_t *cnx = connection(&now, 1);
     cnx->path[0]->smoothed_rtt = rtt;
@@ -251,10 +251,10 @@ static void low_rtt_window(uint64_t rtt) {
     size_t frame_length = stream_frame(cnx, frame, sizeof(frame));
     picoquic_packet_t *packet = pending(cnx, frame, frame_length, now);
     uint64_t inflight = cnx->path[0]->bytes_in_transit;
-    uint64_t delay = rtt / 4, wake = UINT64_MAX;
+    uint64_t wake = UINT64_MAX;
     size_t length = 0;
-    /* The old 100ms floor was at or beyond the rtt/2 exclusion boundary.
-     * Enabled early repeat must have a usable interval, not one exact tick. */
+    /* The ACK-delay floor must not leave only a sub-tick interval before
+     * the rtt/2 exclusion boundary. Higher-RTT timing is unchanged. */
     assert(delay < rtt / 2);
     assert(!repeat(cnx, now + delay - 1, copy, sizeof(copy), &length, &wake));
     assert(length == 0 && wake == now + delay && !packet->was_preemptively_repeated);
@@ -275,7 +275,7 @@ static void low_rtt_window(uint64_t rtt) {
     decode(peer, packet->bytes + packet->offset, frame_length, now + delay + 2);
     assert(received.length == sizeof(payload) && received.fins == 0);
     assert(memcmp(received.bytes, payload, sizeof(payload)) == 0);
-    fprintf(stderr, "POLICY low RTT=%llu us: early=%llu us, one copy, peer bytes once\n",
+    fprintf(stderr, "POLICY repeat window RTT=%llu us: early=%llu us, one copy, peer bytes once\n",
         (unsigned long long)rtt, (unsigned long long)delay);
     picoquic_free(peer->quic);
     picoquic_free(cnx->quic);
@@ -381,7 +381,8 @@ static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
         assert(future && ready_frames(future, &acks, data, 45, data_length) == 1 && !acks);
         assert(!future->was_preemptively_repeated && cnx->nb_preemptive_repeat == 0);
     }
-    now += (rtt == 140000 ? rtt / 4 : PICOQUIC_ACK_DELAY_MAX) + 1;
+    assert(rtt < 400000);
+    now += rtt / 4 + 1;
     if (test == no_room_due) now += 1000;
     if (test != no_ack) {
         assert(picoquic_record_pn_received(cnx, application,
@@ -445,14 +446,19 @@ int main(void) {
     fputs("POLICY controls: FIN, ACKed, reset, destroyed, zero-data, peer duplicate PASS\n", stderr);
     early_copy(0, 0);
     fputs("POLICY open-data early copy: PASS (one copy, pending retained, peer bytes once)\n", stderr);
-    low_rtt_window(40000);
-    low_rtt_window(100000);
-    low_rtt_window(140000);
-    low_rtt_window(200000);
+    const struct { uint64_t rtt, delay; } windows[] = {
+        {200580, 50145}, {40000, 10000}, {100000, 25000}, {140000, 35000},
+        {199999, 49999}, {200000, 50000}, {200004, 50001}, {200380, 50095},
+        {200636, 50159}, {201000, 50250}, {240000, 60000}, {399999, 99999},
+        {400000, 100000}, {400004, 100000}, {800000, 100000}, {1000000, 125000}
+    };
+    for (size_t i = 0; i < sizeof(windows) / sizeof(windows[0]); i++)
+        repeat_window(windows[i].rtt, windows[i].delay);
+    const uint64_t ready_rtts[] = {140000, 200580, 240000, 399999};
     for (int multipath = 0; multipath <= 1; multipath++) {
-        for (int low = 0; low <= 1; low++) {
+        for (size_t i = 0; i < sizeof(ready_rtts) / sizeof(ready_rtts[0]); i++) {
             for (int test = no_ack; test <= no_room_due; test++)
-                ack_slot(multipath, low ? 140000 : 240000, (enum ack_slot_case)test);
+                ack_slot(multipath, ready_rtts[i], (enum ack_slot_case)test);
         }
     }
     return 0;

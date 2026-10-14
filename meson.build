@@ -162,6 +162,11 @@ poll_submit_test = executable('test-poll-submit',
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('poll-submit', poll_submit_test)
+server_readiness_test = executable('test-server-readiness',
+  files('tests/test_server_readiness.c', src / 'slipstream_flow.c', src / 'slipstream_bridge.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('server-readiness', server_readiness_test)
 poll_ack_test = executable('test-poll-ack', files('tests/test_poll_ack.c'),
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])

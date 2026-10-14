@@ -208,6 +208,11 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
                     if (slot->path_id < 0) continue;
                     /* Earlier replies can consume pacing credit and real time.
                      * Prepare against the same clock now, not the batch start. */
+                    /* Backend bytes can arrive while earlier DNS slots are handled.
+                     * Refresh only this owner; lifecycle cleanup would invalidate slots. */
+                    ss_conn *c = picoquic_get_callback_context(slot->cnx);
+                    if (c && c->cnx == slot->cnx)
+                        ss_conn_service(c, picoquic_current_time());
                     ret = picoquic_prepare_packet_ex(slot->cnx, slot->path_id, picoquic_current_time(),
                         send_buffer, send_buffer_size, &send_length,
                         &peer_addr, &local_addr, &if_index, send_msg_ptr);

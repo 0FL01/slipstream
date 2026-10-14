@@ -97,6 +97,11 @@ static size_t test_poll_budget(ss_conn *connection, int path_id, uint64_t now) {
     return f.poll ? 1 : 0;
 }
 
+static void test_service(ss_conn *connection, uint64_t now) {
+    (void)connection; (void)now;
+    CHECK(false); /* This fixture must remain on the client-only branch. */
+}
+
 static ssize_t test_encode(void *slot_ctx, void *app, unsigned char **encoded,
     const unsigned char *buffer, size_t length, size_t *segment,
     struct sockaddr_storage *to, struct sockaddr_storage *from) {
@@ -145,6 +150,7 @@ static int test_send(int fd, struct sockaddr *to, struct sockaddr *from, int if_
 #define picoquic_prepare_next_packet_ex test_prepare_next
 #define picoquic_prepare_packet_ex test_prepare_poll
 #define ss_conn_poll_budget test_poll_budget
+#define ss_conn_service test_service
 #define picoquic_sendmsg test_send
 #define free test_free
 #include "../src/slipstream_sockloop.c"

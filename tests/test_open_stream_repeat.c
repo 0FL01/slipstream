@@ -1,5 +1,6 @@
 #include <picoquic_config.h>
 #include <picoquic_internal.h>
+#include <tls_api.h>
 #include <arpa/inet.h>
 #include <assert.h>
 #include <stdio.h>
@@ -10,15 +11,20 @@ int picoquic_preemptive_retransmit_in_context(picoquic_cnx_t *cnx,
     picoquic_packet_context_t *pkt_ctx, uint64_t rtt, uint64_t current_time,
     uint64_t *next_wake_time, uint8_t *new_bytes, size_t capacity,
     size_t *length, int *has_data, int *more_data, int test_only);
+void *picoquic_setup_test_aead_context(int, const uint8_t *, const char *);
+void *picoquic_pn_enc_create_for_test(const uint8_t *, const char *);
+int picoquic_prepare_packet_ready(picoquic_cnx_t *, picoquic_path_t *,
+    picoquic_packet_t *, uint64_t, uint8_t *, size_t, size_t *, uint64_t *, int *);
 
 static const picoquic_packet_context_enum application = picoquic_packet_context_application;
 static const uint8_t payload[] = {'a', 'b', 'c', 0, 1, 2, 0xff, 'd', 'e', 'f', 'g'};
 
-static picoquic_cnx_t *connection(uint64_t *now, int client) {
+static picoquic_cnx_t *connection_mode(uint64_t *now, int client, int multipath) {
     picoquic_quic_config_t config;
     picoquic_config_init(&config);
     config.nb_connections = 1; config.alpn = "test"; config.enable_sslkeylog = 0;
     config.do_preemptive_repeat = 1;
+    config.multipath_option = multipath;
     picoquic_quic_t *quic = picoquic_create_and_configure(&config, NULL, NULL, *now, now);
     assert(quic);
     struct sockaddr_in address = {0};
@@ -28,6 +34,7 @@ static picoquic_cnx_t *connection(uint64_t *now, int client) {
         picoquic_null_connection_id, (struct sockaddr *)&address, *now, 0, "test", "test", client);
     assert(cnx);
     cnx->cnx_state = picoquic_state_ready;
+    cnx->is_multipath_enabled = multipath != 0;
     /* Symmetric default transport parameters stand in for completed negotiation. */
     cnx->remote_parameters = cnx->local_parameters;
     cnx->maxdata_remote = cnx->remote_parameters.initial_max_data;
@@ -39,6 +46,10 @@ static picoquic_cnx_t *connection(uint64_t *now, int client) {
     cnx->path[0]->p_remote_cnxid->cnx_id.id_len = 8;
     memset(cnx->path[0]->p_remote_cnxid->cnx_id.id, 0xa5, 8);
     return cnx;
+}
+
+static picoquic_cnx_t *connection(uint64_t *now, int client) {
+    return connection_mode(now, client, 0);
 }
 
 static size_t stream_frame(picoquic_cnx_t *cnx, uint8_t *frame, size_t capacity) {
@@ -270,6 +281,138 @@ static void low_rtt_window(uint64_t rtt) {
     picoquic_free(cnx->quic);
 }
 
+/* Exercise the real ready-packet sender, including ACK formatting, congestion
+ * admission, packet protection and pending ownership, rather than only the
+ * preemptive helper. No new transport entry point is exported. */
+static picoquic_cnx_t *ready_sender(uint64_t *now, int multipath, uint64_t rtt) {
+    picoquic_cnx_t *cnx = connection_mode(now, 1, multipath);
+    picoquic_path_t *path = cnx->path[0];
+    static const uint8_t secret[32] = {1, 2, 3, 4};
+    cnx->crypto_context[3].aead_encrypt = picoquic_setup_test_aead_context(1,
+        secret, PICOQUIC_LABEL_QUIC_V1_KEY_BASE);
+    cnx->crypto_context[3].pn_enc = picoquic_pn_enc_create_for_test(secret,
+        PICOQUIC_LABEL_QUIC_V1_KEY_BASE);
+    assert(cnx->crypto_context[3].aead_encrypt && cnx->crypto_context[3].pn_enc);
+    path->send_mtu = 143; path->challenge_verified = 1;
+    path->latest_sent_time = *now; path->cwin = 1000;
+    path->rtt_min = path->smoothed_rtt = rtt;
+    path->rtt_is_initialized = 1; path->retransmit_timer = 1000000;
+    cnx->quic->cwin_max = UINT64_MAX;
+    cnx->local_parameters.active_connection_id_limit = 1;
+    cnx->remote_parameters.active_connection_id_limit = 1;
+    cnx->local_parameters.initial_max_path_id = 0;
+    cnx->is_ack_frequency_updated = 0; cnx->keep_alive_interval = 0;
+    cnx->no_ack_delay = 1;
+    picoquic_set_congestion_algorithm(cnx, picoquic_dcubic_algorithm);
+    path->cwin = 1000;
+    picoquic_update_pacing_data(cnx, path, 1);
+    return cnx;
+}
+
+static picoquic_packet_t *prepare_ready(picoquic_cnx_t *cnx, uint64_t now) {
+    uint8_t wire[143]; size_t sent = 0;
+    uint64_t wake = UINT64_MAX; int initial = 0;
+    picoquic_packet_t *packet = picoquic_create_packet(cnx->quic);
+    assert(packet);
+    assert(picoquic_prepare_packet_ready(cnx, cnx->path[0], packet, now,
+        wire, sizeof(wire), &sent, &wake, &initial) == 0);
+    if (!sent) { picoquic_recycle_packet(cnx->quic, packet); return NULL; }
+    assert(sent <= sizeof(wire) && packet->is_queued_for_retransmit);
+    return packet;
+}
+
+static unsigned ready_frames(picoquic_packet_t *packet, unsigned *acks,
+    const uint8_t *expected, size_t expected_length, uint64_t expected_offset) {
+    unsigned streams = 0; *acks = 0;
+    for (size_t i = packet->offset; i < packet->length;) {
+        size_t used = 0; int pure = 0; uint64_t type = 0;
+        assert(picoquic_frames_varint_decode(packet->bytes + i,
+            packet->bytes + packet->length, &type));
+        assert(picoquic_skip_frame(packet->bytes + i, packet->length - i,
+            &used, &pure) == 0 && used);
+        *acks += type == picoquic_frame_type_ack || type == picoquic_frame_type_ack_ecn ||
+            type == picoquic_frame_type_path_ack || type == picoquic_frame_type_path_ack_ecn;
+        if (type >= picoquic_frame_type_stream_range_min &&
+            type <= picoquic_frame_type_stream_range_max) {
+            uint64_t id = UINT64_MAX, offset = UINT64_MAX;
+            size_t length = 0, header = 0; int fin = -1;
+            assert(picoquic_parse_stream_header(packet->bytes + i, used,
+                &id, &offset, &length, &fin, &header) == 0);
+            assert(id == 0 && offset == expected_offset && !fin);
+            assert(length == expected_length && header + length == used);
+            assert(memcmp(packet->bytes + i + header, expected, length) == 0);
+            streams++;
+        }
+        assert(type != picoquic_frame_type_ping);
+        i += used;
+    }
+    return streams;
+}
+
+enum ack_slot_case { no_ack, coalesce_ack, fresh_data, no_room, forced_no_room, cwin_blocked };
+
+static void ack_slot(int multipath, uint64_t rtt, enum ack_slot_case test) {
+    uint64_t now = 1000000;
+    picoquic_cnx_t *cnx = ready_sender(&now, multipath, rtt);
+    picoquic_path_t *path = cnx->path[0];
+    picoquic_packet_context_t *ctx = multipath ? &path->pkt_ctx : &cnx->pkt_ctx[application];
+    size_t header = picoquic_predict_packet_header_length(cnx,
+        picoquic_packet_1rtt_protected, ctx);
+    uint8_t data[128], original_bytes[128]; memset(data, 0x36, sizeof(data));
+    int large = test == no_room || test == forced_no_room;
+    size_t data_length = large ? path->send_mtu - header - 16 - 4 : 45;
+    assert(data_length > 0 && data_length < sizeof(data));
+    assert(picoquic_add_to_stream(cnx, 0, data, data_length, 0) == 0);
+    picoquic_packet_t *original = prepare_ready(cnx, now);
+    assert(original && !original->was_preemptively_repeated);
+    assert(picoquic_find_stream(cnx, 0)->send_queue == NULL);
+    assert(original->length <= sizeof(original_bytes));
+    memcpy(original_bytes, original->bytes, original->length);
+    uint64_t original_time = original->send_time, original_number = original->sequence_number;
+    now += (rtt == 140000 ? rtt / 4 : PICOQUIC_ACK_DELAY_MAX) + 1;
+    if (test != no_ack) {
+        assert(picoquic_record_pn_received(cnx, application,
+            path->p_local_cnxid, 0, now) == 0);
+        picoquic_set_ack_needed(cnx, now, application, path, 1);
+    }
+    if (test == fresh_data)
+        assert(picoquic_add_to_stream(cnx, 0, data, data_length, 0) == 0);
+    if (test == cwin_blocked) path->cwin = 1;
+    if (test == forced_no_room) {
+        cnx->is_forced_probe_up_required = 1; path->is_cca_probing_up = 1;
+    }
+    picoquic_packet_t *packet = prepare_ready(cnx, now);
+    assert(packet && ctx->pending_first == original && original->is_queued_for_retransmit);
+    assert(original->send_time == original_time && original->sequence_number == original_number);
+    assert(memcmp(original->bytes, original_bytes, original->length) == 0);
+    unsigned acks = 0;
+    unsigned streams = ready_frames(packet, &acks, data, data_length,
+        test == fresh_data ? data_length : 0);
+    assert(acks == (unsigned)(test != no_ack));
+    if (large || test == cwin_blocked) {
+        /* A failed fit is not a copy. An ACK-only packet must not acquire the
+         * copy flag, and forced-probe fallback must not append a PING here. */
+        assert(!streams && !original->was_preemptively_repeated &&
+            !packet->is_preemptive_repeat && cnx->nb_preemptive_repeat == 0);
+        if (large) {
+            packet = prepare_ready(cnx, now + 1);
+            assert(packet && ready_frames(packet, &acks, data, data_length, 0) == 1 && !acks);
+            assert(original->was_preemptively_repeated && packet->is_preemptive_repeat);
+            assert(cnx->nb_preemptive_repeat == 1);
+        }
+    } else if (test == fresh_data) {
+        assert(streams == 1 && !original->was_preemptively_repeated &&
+            !packet->is_preemptive_repeat && cnx->nb_preemptive_repeat == 0);
+    } else {
+        assert(streams == 1 && original->was_preemptively_repeated &&
+            packet->is_preemptive_repeat && cnx->nb_preemptive_repeat == 1);
+    }
+    fprintf(stderr, "POLICY ready ACK slot: mp=%d RTT=%llu case=%d copies=%llu checked\n",
+        multipath, (unsigned long long)rtt, (int)test,
+        (unsigned long long)cnx->nb_preemptive_repeat);
+    picoquic_free(cnx->quic);
+}
+
 int main(void) {
     early_copy(1, 0);
     early_copy(1, 1); /* Empty FIN retains the baseline eligibility. */
@@ -281,5 +424,11 @@ int main(void) {
     low_rtt_window(100000);
     low_rtt_window(140000);
     low_rtt_window(200000);
+    for (int multipath = 0; multipath <= 1; multipath++) {
+        for (int low = 0; low <= 1; low++) {
+            for (int test = no_ack; test <= cwin_blocked; test++)
+                ack_slot(multipath, low ? 140000 : 240000, (enum ack_slot_case)test);
+        }
+    }
     return 0;
 }

@@ -1,0 +1,28 @@
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -3648,6 +3648,7 @@ int picoquic_prepare_packet_ready(picoquic_cnx_t* cnx, picoquic_path_t* path_x,
+                         if (cnx->is_preemptive_repeat_enabled ||
+                             (cnx->is_forced_probe_up_required && path_x->is_cca_probing_up)) {
+-                            if (length <= header_length) {
++                            if (length <= header_length || is_pure_ack) {
++                                size_t length_before_repeat = length;
+                                 /* Consider redundant retransmission:
+                                  * if the redundant retransmission index is null:
+                                  * - if the packet loss rate is large enough compared to BDP, set index to last sent packet.
+@@ -3657,12 +3658,13 @@ int picoquic_prepare_packet_ready(picoquic_cnx_t* cnx, picoquic_path_t* path_x,
+                                  */
+                                  ret = picoquic_preemptive_retransmit_as_needed(cnx, path_x, pc, current_time, next_wake_time, bytes_next,
+                                     bytes_max - bytes_next, &length, &more_data, &is_pure_ack);
+-                                 if (length > header_length) {
++                                 if (length > length_before_repeat) {
+                                      preemptive_repeat = 1;
+                                      packet->is_preemptive_repeat = 1;
+                                      bytes_next = bytes + length;
+                                  }
+-                                 else if (cnx->is_forced_probe_up_required && path_x->is_cca_probing_up) {
++                                 else if (length_before_repeat <= header_length &&
++                                     cnx->is_forced_probe_up_required && path_x->is_cca_probing_up) {
+                                      *bytes_next++ = picoquic_frame_type_ping;
+                                      memset(bytes_next, picoquic_frame_type_padding, bytes_max - bytes_next);
+                                      bytes_next = bytes_max;

@@ -1,0 +1,13 @@
+diff --git a/picoquic/timing.c b/picoquic/timing.c
+--- a/picoquic/timing.c
++++ b/picoquic/timing.c
+@@ -183,7 +183,8 @@
+         uint64_t rtt_estimate = 0;
+         int is_first = !old_path->rtt_is_initialized;
+         picoquic_packet_context_t* pkt_ctx = NULL;
+-        if (cnx->is_multipath_enabled) {
++        /* Only 1-RTT packets use the negotiated per-path number space. */
++        if (cnx->is_multipath_enabled && epoch == picoquic_epoch_1rtt) {
+             pkt_ctx = &old_path->pkt_ctx;
+         }
+         else if (epoch == picoquic_epoch_1rtt || epoch == picoquic_epoch_0rtt) {

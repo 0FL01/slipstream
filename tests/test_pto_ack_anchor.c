@@ -12,7 +12,7 @@ void picoquic_insert_hole_in_send_sequence_if_needed(picoquic_cnx_t *cnx,
     picoquic_path_t *path, picoquic_packet_context_t *ctx, uint64_t now, uint64_t *wake);
 static const picoquic_packet_context_enum application = picoquic_packet_context_application;
 static const uint8_t payload[] = {'a', 'b', 0, 1, 0xff, 'c'};
-static unsigned failures, timeout_notifications, repeat_notifications;
+static unsigned failures, timeout_notifications, repeat_notifications, rtt_notifications, ack_notifications;
 static picoquic_congestion_algorithm_t observer;
 
 #define CHECK(condition) do { if (!(condition)) { \
@@ -24,6 +24,8 @@ static void observe_loss(picoquic_cnx_t *cnx, picoquic_path_t *path,
     picoquic_per_ack_state_t *state, uint64_t now) {
     timeout_notifications += notification == picoquic_congestion_notification_timeout;
     repeat_notifications += notification == picoquic_congestion_notification_repeat;
+    rtt_notifications += notification == picoquic_congestion_notification_rtt_measurement;
+    ack_notifications += notification == picoquic_congestion_notification_acknowledgement;
     picoquic_dcubic_algorithm->alg_notify(cnx, path, notification, state, now);
 }
 
@@ -73,7 +75,7 @@ static picoquic_cnx_t *connection(uint64_t *now, int multipath, int two_paths) {
     observer = *picoquic_dcubic_algorithm;
     observer.alg_notify = observe_loss;
     picoquic_set_congestion_algorithm(cnx, &observer);
-    timeout_notifications = repeat_notifications = 0;
+    timeout_notifications = repeat_notifications = rtt_notifications = ack_notifications = 0;
     return cnx;
 }
 
@@ -82,7 +84,8 @@ static picoquic_packet_t *pending(picoquic_cnx_t *cnx, picoquic_path_t *path,
     picoquic_packet_context_t *ctx = context(cnx, path, pc);
     picoquic_packet_t *packet = picoquic_create_packet(cnx->quic);
     assert(packet);
-    packet->ptype = pc == application ? picoquic_packet_1rtt_protected : picoquic_packet_handshake;
+    packet->ptype = pc == application ? picoquic_packet_1rtt_protected :
+        pc == picoquic_packet_context_initial ? picoquic_packet_initial : picoquic_packet_handshake;
     packet->pc = pc;
     size_t header = picoquic_predict_packet_header_length(cnx, packet->ptype, ctx);
     size_t pn_offset = 0, pn_length = 0;
@@ -133,6 +136,76 @@ static picoquic_packet_t *tail(picoquic_cnx_t *cnx, picoquic_path_t *path,
     size_t consumed = 0; int pure = 0;
     assert(picoquic_skip_frame(bytes, length, &consumed, &pure) == 0 && pure);
     return pending(cnx, path, pc, bytes, length, now);
+}
+
+static void acknowledge_rtt(picoquic_cnx_t *cnx, picoquic_path_t *path,
+    picoquic_packet_context_enum pc, uint64_t pn, uint64_t now) {
+    uint8_t ack[64], *end = ack;
+    int mp = cnx->is_multipath_enabled && pc == application;
+    end = picoquic_frames_varint_encode(end, ack + sizeof(ack),
+        mp ? picoquic_frame_type_path_ack : picoquic_frame_type_ack);
+    if (mp) end = picoquic_frames_varint_encode(end, ack + sizeof(ack), path->unique_path_id);
+    end = picoquic_frames_varint_encode(end, ack + sizeof(ack), pn);
+    for (unsigned i = 0; i < 3; i++) end = picoquic_frames_varint_encode(end, ack + sizeof(ack), 0);
+    assert(end);
+    struct sockaddr *address = (struct sockaddr *)&path->peer_addr;
+    int epoch = pc == application ? picoquic_epoch_1rtt :
+        pc == picoquic_packet_context_initial ? picoquic_epoch_initial : picoquic_epoch_handshake;
+    assert(picoquic_decode_frames(cnx, path, ack, (size_t)(end - ack), NULL,
+        epoch, address, address, 0, 0, now) == 0);
+}
+
+/* An Initial/Handshake ACK after MP negotiation must not copy the empty
+ * application's UINT64_MAX sentinel into the RTT-period packet marker. Use
+ * genuine queued packets and wire ACKs, then vary RTT beyond that first epoch. */
+static void rtt_epoch_context(int multipath, picoquic_packet_context_enum pc) {
+    uint64_t now = 1000000;
+    picoquic_cnx_t *cnx = connection(&now, multipath, multipath);
+    picoquic_path_t *path = cnx->path[0];
+    path->send_mtu = 143;
+    const uint8_t ping[] = {picoquic_frame_type_ping};
+    picoquic_packet_t *packet = pending(cnx, path, pc, ping, sizeof(ping), now);
+    uint64_t pn = packet->sequence_number;
+    now += 200000;
+    acknowledge_rtt(cnx, path, pc, pn, now);
+    CHECK(path->rtt_is_initialized && path->smoothed_rtt == 200000);
+    CHECK(path->rtt_packet_previous_period != UINT64_MAX);
+    const uint64_t samples[] = {50000, 300000, 80000, 60000};
+    for (unsigned i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
+        now += 500000;
+        packet = stream_packet(cnx, path, now);
+        pn = packet->sequence_number;
+        now += samples[i];
+        acknowledge_rtt(cnx, path, application, pn, now);
+        CHECK(path->rtt_packet_previous_period == pn);
+        /* Application PN0 can share the initial period marker; later ACKs
+         * must advance and flush the accumulated period normally. */
+        if (i > 0) CHECK(path->nb_rtt_estimate_in_period == 0);
+    }
+    CHECK(path->smoothed_rtt == 166981 && path->bytes_in_transit == 0);
+    CHECK(rtt_notifications == 5 && ack_notifications == 5);
+    if (multipath) {
+        /* A second path has its own application period, independent of path0. */
+        picoquic_path_t *other = cnx->path[1];
+        uint64_t previous = path->rtt_packet_previous_period, smoothed = path->smoothed_rtt;
+        now += 500000;
+        /* Path validation supplies a first RTT sample with epoch -1. */
+        now += 90000;
+        picoquic_update_path_rtt(cnx, other, other, -1, now - 90000, now, 0, 0);
+        for (unsigned i = 0; i < 2; i++) {
+            now += 500000;
+            packet = stream_packet(cnx, other, now);
+            pn = packet->sequence_number;
+            now += 90000;
+            acknowledge_rtt(cnx, other, application, pn, now);
+        }
+        CHECK(other->smoothed_rtt == 90000 && other->rtt_packet_previous_period == pn);
+        CHECK(path->rtt_packet_previous_period == previous && path->smoothed_rtt == smoothed);
+        CHECK(other->bytes_in_transit == 0 && rtt_notifications == 8 && ack_notifications == 7);
+    }
+    fprintf(stderr, "RTT mp=%d epoch_context=%d srtt=%" PRIu64 " period=%" PRIu64 " checked\n",
+        multipath, (int)pc, path->smoothed_rtt, path->rtt_packet_previous_period);
+    picoquic_free(cnx->quic);
 }
 
 static uint64_t recover(picoquic_cnx_t *cnx, picoquic_path_t *path,
@@ -326,6 +399,8 @@ static void other_packet_context(void) {
 
 int main(void) {
     for (int mp = 0; mp <= 1; mp++) {
+        rtt_epoch_context(mp, picoquic_packet_context_initial);
+        rtt_epoch_context(mp, picoquic_packet_context_handshake);
         new_data_and_context(mp);
         safety_and_rack(mp);
         for (unsigned rounds = 0; rounds <= 2; rounds++) {

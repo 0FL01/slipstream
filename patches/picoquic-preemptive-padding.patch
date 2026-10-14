@@ -1,0 +1,19 @@
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -3840,6 +3840,16 @@
+
+         if (*is_initial_sent || (is_challenge_padding_needed && length < PICOQUIC_ENFORCED_INITIAL_MTU)){
+             length = picoquic_pad_to_target_length(bytes, length, (uint32_t)(send_buffer_min_max - checksum_overhead));
++        }
++        else if (packet->is_preemptive_repeat) {
++            size_t target = cnx->padding_minsize;
++            if (target < PICOQUIC_RESET_PACKET_MIN_SIZE) {
++                target = PICOQUIC_RESET_PACKET_MIN_SIZE;
++            }
++            if (target > send_buffer_min_max - checksum_overhead) {
++                target = send_buffer_min_max - checksum_overhead;
++            }
++            length = picoquic_pad_to_target_length(bytes, length, target);
+         }
+         else {
+             length = picoquic_pad_to_policy(cnx, bytes, length, (uint32_t)(send_buffer_min_max - checksum_overhead));

@@ -15,7 +15,8 @@ for name in ("picoquic-path-identity.patch", "picoquic-app-credit.patch",
              "picoquic-open-stream-repeat.patch", "picoquic-rtt-epoch-context.patch",
              "picoquic-low-rtt-repeat-window.patch", "picoquic-ack-slot-repeat.patch",
              "picoquic-ack-repeat-cursor.patch", "picoquic-poll-response-ack.patch",
-             "picoquic-preemptive-copy-bound.patch", "picoquic-preemptive-data-credit.patch"):
+             "picoquic-preemptive-copy-bound.patch", "picoquic-preemptive-data-credit.patch",
+             "picoquic-preemptive-padding.patch"):
     patch = root / name
     if git(patch, "--reverse", "--check").returncode == 0:
         continue

@@ -279,12 +279,15 @@ static void originals_compete(bool client, int multipath, uint64_t cwin) {
     assert(!picoquic_add_to_stream(cnx, 0, old, sizeof(old), 0));
     picoquic_packet_t *second = prepare(&c, now + 4000, false); assert(second);
     assert(first != second && !first->is_preemptive_repeat && !second->is_preemptive_repeat);
+    assert(first->length + first->checksum_overhead == 143);
+    assert(second->length + second->checksum_overhead == 143);
     unsigned copies = 0; uint64_t first_copy_number = UINT64_MAX;
     for (unsigned i = 0; i < 2; i++) {
         picoquic_packet_t *copy = prepare(&c, now + 35001 + i * 4000, false);
         if (copy) {
             unsigned acks = 0;
             assert(copy->is_preemptive_repeat);
+            assert(copy->length + copy->checksum_overhead == (i ? 75u : 74u));
             assert(copy_credit_frames(copy, &acks, old, sizeof(old), i * sizeof(old)) == 1 && !acks);
             if (copies == 0) first_copy_number = copy->sequence_number;
             copies++;
@@ -303,11 +306,12 @@ static void originals_compete(bool client, int multipath, uint64_t cwin) {
         client, multipath, (unsigned long long)cwin, copies,
         (unsigned long long)(stream->sent_offset - before), stream->send_queue != NULL,
         (unsigned long long)path->bytes_in_transit);
-    assert(copies == (cwin == 686 ? 1u : 2u));
+    assert(copies == (cwin == 640 ? 1u : 2u));
     assert(stream->sent_offset - before == sizeof(fresh) && !stream->send_queue);
+    assert(path->bytes_in_transit <= cwin);
     assert(first->was_preemptively_repeated);
-    assert(second->was_preemptively_repeated == (cwin != 686));
-    if (cwin == 686) {
+    assert(second->was_preemptively_repeated == (cwin != 640));
+    if (cwin == 640) {
         uint8_t ack[64], *end = ack + sizeof(ack);
         uint8_t *b = picoquic_frames_varint_encode(ack, end,
             multipath ? picoquic_frame_type_path_ack : picoquic_frame_type_ack);
@@ -342,6 +346,7 @@ int main(void) {
         interleave(client != 0, 0, true); interleave(client != 0, 1, true);
         edges(client != 0);
         for (int mp = 0; mp < 2; mp++) {
+            originals_compete(client != 0, mp, 640);
             originals_compete(client != 0, mp, 686);
             originals_compete(client != 0, mp, 1000);
             copy_admission_edges(client != 0, mp);

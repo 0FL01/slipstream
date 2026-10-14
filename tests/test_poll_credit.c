@@ -201,11 +201,151 @@ static void small_window_response(int multipath) {
     cleanup(&sender, send_peer); cleanup(&receiver, recv_peer);
 }
 
+static unsigned copy_credit_frames(picoquic_packet_t *packet, unsigned *acks,
+    const uint8_t *expected, size_t expected_length, uint64_t expected_offset) {
+    unsigned streams = 0; *acks = 0;
+    for (size_t i = packet->offset; i < packet->length;) {
+        size_t used = 0; int pure = 0; uint64_t type = 0;
+        assert(picoquic_frames_varint_decode(packet->bytes + i,
+            packet->bytes + packet->length, &type));
+        assert(picoquic_skip_frame(packet->bytes + i, packet->length - i,
+            &used, &pure) == 0 && used);
+        *acks += type == picoquic_frame_type_ack || type == picoquic_frame_type_ack_ecn ||
+            type == picoquic_frame_type_path_ack || type == picoquic_frame_type_path_ack_ecn;
+        if (type >= picoquic_frame_type_stream_range_min &&
+            type <= picoquic_frame_type_stream_range_max) {
+            uint64_t id = UINT64_MAX, offset = UINT64_MAX;
+            size_t length = 0, header = 0; int fin = -1;
+            assert(picoquic_parse_stream_header(packet->bytes + i, used,
+                &id, &offset, &length, &fin, &header) == 0);
+            assert(id == 0 && offset == expected_offset && !fin);
+            assert(length == expected_length && header + length == used);
+            assert(memcmp(packet->bytes + i + header, expected, length) == 0);
+            streams++;
+        }
+        assert(type != picoquic_frame_type_ping);
+        i += used;
+    }
+    return streams;
+}
+
+/* Existing internal formatter; this fixture exports no transport API. */
+int picoquic_preemptive_retransmit_as_needed(picoquic_cnx_t *, picoquic_path_t *,
+    picoquic_packet_context_enum, uint64_t, uint64_t *, uint8_t *, size_t,
+    size_t *, int *, int *);
+
+static void copy_admission_edges(bool client, int multipath) {
+    static const struct { uint64_t cwin; size_t mtu; int copies; } cases[] = {
+        {0,143,0}, {142,143,0}, {143,143,0}, {286,143,0},
+        {428,143,0}, {429,143,1}, {UINT64_MAX,143,1}, {1000,0,0}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint64_t now = 1000000; ss_conn c;
+        int peer = setup(&c, &now, client, multipath);
+        picoquic_cnx_t *cnx = c.cnx; picoquic_path_t *path = cnx->path[0];
+        const uint8_t old[45] = {1, 2, 3};
+        assert(!picoquic_add_to_stream(cnx, 0, old, sizeof(old), 0));
+        picoquic_packet_t *original = prepare(&c, now, false); assert(original);
+        assert(path->bytes_in_transit == 143);
+        picoquic_packet_context_t *ctx = multipath ? &path->pkt_ctx :
+            &cnx->pkt_ctx[picoquic_packet_context_application];
+        picoquic_packet_t *cursor = ctx->preemptive_repeat_ptr;
+        path->cwin = cases[i].cwin; path->send_mtu = cases[i].mtu;
+        uint8_t bytes[127]; size_t length = 0;
+        int more = 0, pure = 1; uint64_t wake = UINT64_MAX;
+        assert(!picoquic_preemptive_retransmit_as_needed(cnx, path,
+            picoquic_packet_context_application, now + 35001, &wake,
+            bytes, sizeof(bytes), &length, &more, &pure));
+        assert(path->cwin == cases[i].cwin && path->bytes_in_transit == 143);
+        assert(cnx->nb_preemptive_repeat == (uint64_t)cases[i].copies);
+        assert(original->was_preemptively_repeated == cases[i].copies);
+        assert((length > 0) == cases[i].copies && pure == !cases[i].copies);
+        assert(length <= sizeof(bytes) && ctx->pending_first == original);
+        if (!cases[i].copies) {
+            assert(ctx->preemptive_repeat_ptr == cursor && wake == UINT64_MAX && !more);
+        }
+        cleanup(&c, peer);
+    }
+}
+
+static void originals_compete(bool client, int multipath, uint64_t cwin) {
+    uint64_t now = 1000000; ss_conn c;
+    int peer = setup(&c, &now, client, multipath);
+    picoquic_cnx_t *cnx = c.cnx; picoquic_path_t *path = cnx->path[0];
+    path->cwin = cwin;
+    const uint8_t old[45] = {1, 2, 3};
+    assert(!picoquic_add_to_stream(cnx, 0, old, sizeof(old), 0));
+    picoquic_packet_t *first = prepare(&c, now, false); assert(first);
+    assert(!picoquic_add_to_stream(cnx, 0, old, sizeof(old), 0));
+    picoquic_packet_t *second = prepare(&c, now + 4000, false); assert(second);
+    assert(first != second && !first->is_preemptive_repeat && !second->is_preemptive_repeat);
+    unsigned copies = 0; uint64_t first_copy_number = UINT64_MAX;
+    for (unsigned i = 0; i < 2; i++) {
+        picoquic_packet_t *copy = prepare(&c, now + 35001 + i * 4000, false);
+        if (copy) {
+            unsigned acks = 0;
+            assert(copy->is_preemptive_repeat);
+            assert(copy_credit_frames(copy, &acks, old, sizeof(old), i * sizeof(old)) == 1 && !acks);
+            if (copies == 0) first_copy_number = copy->sequence_number;
+            copies++;
+        }
+    }
+    picoquic_stream_head_t *stream = picoquic_find_stream(cnx, 0);
+    uint64_t before = stream->sent_offset;
+    const uint8_t fresh[132] = {4, 5, 6};
+    assert(!picoquic_add_to_stream(cnx, 0, fresh, sizeof(fresh), 0));
+    for (unsigned i = 0; i < 4 && stream->send_queue; i++) {
+        picoquic_packet_t *packet = prepare(&c, now + 40000 + i, false);
+        if (!packet) break;
+        assert(!packet->is_preemptive_repeat);
+    }
+    fprintf(stderr, "FRESH_CREDIT client=%d mp=%d cwin=%llu copies=%u fresh=%llu queued=%d flight=%llu\n",
+        client, multipath, (unsigned long long)cwin, copies,
+        (unsigned long long)(stream->sent_offset - before), stream->send_queue != NULL,
+        (unsigned long long)path->bytes_in_transit);
+    assert(copies == (cwin == 686 ? 1u : 2u));
+    assert(stream->sent_offset - before == sizeof(fresh) && !stream->send_queue);
+    assert(first->was_preemptively_repeated);
+    assert(second->was_preemptively_repeated == (cwin != 686));
+    if (cwin == 686) {
+        uint8_t ack[64], *end = ack + sizeof(ack);
+        uint8_t *b = picoquic_frames_varint_encode(ack, end,
+            multipath ? picoquic_frame_type_path_ack : picoquic_frame_type_ack);
+        if (multipath) b = picoquic_frames_varint_encode(b, end, path->unique_path_id);
+        b = picoquic_frames_varint_encode(b, end, first_copy_number);
+        b = picoquic_frames_varint_encode(b, end, 0);
+        assert(first_copy_number == first->sequence_number + 2);
+        b = picoquic_frames_varint_encode(b, end, 1);
+        b = picoquic_frames_varint_encode(b, end, 0);
+        b = picoquic_frames_varint_encode(b, end, 0);
+        b = picoquic_frames_varint_encode(b, end, 0);
+        assert(b);
+        struct sockaddr_in address = {0}; address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); address.sin_port = htons(53);
+        assert(!picoquic_decode_frames(cnx, path, ack, b - ack, NULL, picoquic_epoch_1rtt,
+            (struct sockaddr *)&address, (struct sockaddr *)&address, 99, 0, now + 41000));
+        assert(path->cwin > path->bytes_in_transit &&
+            (path->cwin - path->bytes_in_transit) / path->send_mtu >= 2);
+        picoquic_packet_t *resumed = prepare(&c, now + 42000, false); unsigned acks = 0;
+        assert(resumed);
+        assert(copy_credit_frames(resumed, &acks, old, sizeof(old), sizeof(old)) == 1 && !acks);
+        assert(cnx->nb_preemptive_repeat == 1u + resumed->is_preemptive_repeat);
+        fprintf(stderr, "FRESH_CREDIT client=%d mp=%d genuine ACK resumes deferred bytes preemptive=%u\n",
+            client, multipath, resumed->is_preemptive_repeat);
+    }
+    cleanup(&c, peer);
+}
+
 int main(void) {
     for (int client = 0; client < 2; client++) {
         interleave(client != 0, 0, false); interleave(client != 0, 1, false);
         interleave(client != 0, 0, true); interleave(client != 0, 1, true);
         edges(client != 0);
+        for (int mp = 0; mp < 2; mp++) {
+            originals_compete(client != 0, mp, 686);
+            originals_compete(client != 0, mp, 1000);
+            copy_admission_edges(client != 0, mp);
+        }
     }
     small_window_response(0); small_window_response(1);
     return 0;

@@ -1,0 +1,16 @@
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -1445,6 +1445,12 @@
+     picoquic_packet_context_t* pkt_ctx;
+     uint64_t rtt = path_x->smoothed_rtt;
++    /* Speculative repair must leave credit for the next fresh packet. */
++    uint64_t credit = path_x->cwin > path_x->bytes_in_transit ?
++        path_x->cwin - path_x->bytes_in_transit : 0;
++    if (path_x->send_mtu == 0 || credit / path_x->send_mtu < 2) {
++        return 0;
++    }
+
+     if (pc == picoquic_packet_context_application &&
+         cnx->is_multipath_enabled) {
+         for (int i = 0; i < cnx->nb_paths; i++) {

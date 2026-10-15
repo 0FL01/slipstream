@@ -1,16 +1,199 @@
-diff --git a/picoquic/sender.c b/picoquic/sender.c
 --- a/picoquic/sender.c
 +++ b/picoquic/sender.c
-@@ -1445,6 +1445,12 @@
+@@ -1256,7 +1256,9 @@
+     size_t send_buffer_max_minus_checksum,
+     size_t* length,
+     int * has_data,
+-    int * deferred)
++    int * deferred,
++    size_t copy_budget,
++    int measure_only)
+ {
+     /* check if this is an ACK only packet */
+     int ret = 0;
+@@ -1270,6 +1272,21 @@
+     size_t initial_length = *length;
+     *has_data = 0;
+ 
++    if (!measure_only && copy_budget != SIZE_MAX) {
++        size_t prospective = initial_length;
++        int measured_data = 0, measured_deferred = 0;
++        ret = picoquic_preemptive_retransmit_packet(old_p, cnx, NULL,
++            send_buffer_max_minus_checksum, &prospective, &measured_data,
++            &measured_deferred, SIZE_MAX, 1);
++        if (ret != 0) {
++            return ret;
++        }
++        if (measured_data && prospective - initial_length > copy_budget) {
++            *deferred = -1; /* Credit failure: no bytes or original flags changed. */
++            return 0;
++        }
++    }
++
+     if (!old_p->is_preemptive_repeat &&
+         !old_p->is_mtu_probe &&
+         !old_p->is_ack_trap &&
+@@ -1295,14 +1312,18 @@
+                     /* If length is not present, check whether needed */
+                     if (write_index + frame_length < send_buffer_max_minus_checksum) {
+                         size_t pad_needed = send_buffer_max_minus_checksum - write_index - frame_length;
+-                        memset(&new_bytes[write_index], picoquic_frame_type_padding, pad_needed);
++                        if (!measure_only) {
++                            memset(&new_bytes[write_index], picoquic_frame_type_padding, pad_needed);
++                        }
+                         *length += pad_needed;
+                         write_index += pad_needed;
+                     }
+                 }
+                 /* copy the frame */
+                 if (write_index + frame_length <= send_buffer_max_minus_checksum) {
+-                    memcpy(&new_bytes[write_index], &old_p->bytes[byte_index], frame_length);
++                    if (!measure_only) {
++                        memcpy(&new_bytes[write_index], &old_p->bytes[byte_index], frame_length);
++                    }
+                     write_index += frame_length;
+                     *length += frame_length;
+                     *has_data = 1;
+@@ -1321,7 +1342,7 @@
+             *length = initial_length;
+             *has_data = 0;
+             is_repeated = 0;
+-        } else if (is_repeated) {
++        } else if (is_repeated && !measure_only) {
+             old_p->was_preemptively_repeated = 1;
+         }
+     }
+@@ -1331,7 +1352,7 @@
+     return ret;
+ }
+ 
+-int picoquic_preemptive_retransmit_in_context(
++static int picoquic_preemptive_retransmit_in_context_budget(
+     picoquic_cnx_t* cnx,
+     picoquic_packet_context_t* pkt_ctx,
+     uint64_t rtt,
+@@ -1341,8 +1362,9 @@
+     size_t send_buffer_max_minus_checksum,
+     size_t* length,
+     int *has_data,
+-    int *more_data, 
+-    int test_only)
++    int *more_data,
++    int test_only,
++    size_t copy_budget)
+ {
+     /* If there is a single packet context for application frames,
+      * the code just has to track the preemptive_repeat_ptr for
+@@ -1351,6 +1373,7 @@
+      */
+     int ret = 0;
+     picoquic_packet_t* first_deferred_repeat = NULL;
++    picoquic_packet_t* saved_cursor = pkt_ctx->preemptive_repeat_ptr;
+ 
+     /* Check that the connection is still active before adding more preemptive repeats */
+     if (cnx->latest_progress_time + rtt < current_time ||
+@@ -1394,7 +1417,11 @@
+             }
+             int deferred = 0;
+             ret = picoquic_preemptive_retransmit_packet(pkt_ctx->preemptive_repeat_ptr, cnx,
+-                new_bytes, send_buffer_max_minus_checksum, length, has_data, &deferred);
++                new_bytes, send_buffer_max_minus_checksum, length, has_data, &deferred, copy_budget, 0);
++            if (deferred < 0) {
++                pkt_ctx->preemptive_repeat_ptr = saved_cursor;
++                return ret;
++            }
+             if (ret != 0) {
+                 break;
+             }
+@@ -1418,6 +1445,16 @@
+         *more_data = 1;
+     }
+     return ret;
++}
++
++int picoquic_preemptive_retransmit_in_context(
++    picoquic_cnx_t* cnx, picoquic_packet_context_t* pkt_ctx, uint64_t rtt,
++    uint64_t current_time, uint64_t* next_wake_time, uint8_t* new_bytes,
++    size_t capacity, size_t* length, int* has_data, int* more_data, int test_only)
++{
++    return picoquic_preemptive_retransmit_in_context_budget(cnx, pkt_ctx, rtt,
++        current_time, next_wake_time, new_bytes, capacity, length, has_data,
++        more_data, test_only, SIZE_MAX);
+ }
+ 
+ int picoquic_preemptive_retransmit_as_needed(
+@@ -1444,14 +1481,40 @@
+     int has_data = 0;
      picoquic_packet_context_t* pkt_ctx;
      uint64_t rtt = path_x->smoothed_rtt;
-+    /* Speculative repair must leave credit for the next fresh packet. */
-+    uint64_t credit = path_x->cwin > path_x->bytes_in_transit ?
-+        path_x->cwin - path_x->bytes_in_transit : 0;
-+    if (path_x->send_mtu == 0 || credit / path_x->send_mtu < 2) {
++    /* The actual protected copy, including the existing prefix and final
++     * minimum padding, must leave one full MTU under BOTH credit limits. */
++    uint64_t limit = path_x->cwin < cnx->quic->cwin_max ? path_x->cwin : cnx->quic->cwin_max;
++    uint64_t credit = limit > path_x->bytes_in_transit ? limit - path_x->bytes_in_transit : 0;
++    size_t copy_budget = SIZE_MAX;
++    if (path_x->send_mtu == 0 || credit <= path_x->send_mtu) {
 +        return 0;
 +    }
-
++    if (pc == picoquic_packet_context_application) {
++        size_t checksum = picoquic_get_checksum_length(cnx, picoquic_epoch_1rtt);
++        picoquic_packet_context_t* out_ctx = cnx->is_multipath_enabled ?
++            &path_x->pkt_ctx : &cnx->pkt_ctx[pc];
++        size_t prefix = picoquic_predict_packet_header_length(cnx, picoquic_packet_1rtt_protected, out_ctx);
++        uint64_t budget = credit - path_x->send_mtu;
++        size_t minimum = cnx->padding_minsize;
++        if (prefix < *length) prefix = *length;
++        if (send_buffer_max_minus_checksum > SIZE_MAX - prefix) return 0;
++        if (minimum < PICOQUIC_RESET_PACKET_MIN_SIZE) minimum = PICOQUIC_RESET_PACKET_MIN_SIZE;
++        if (minimum > prefix + send_buffer_max_minus_checksum) minimum = prefix + send_buffer_max_minus_checksum;
++        if (budget < checksum || budget - checksum < minimum || budget - checksum < prefix) return 0;
++        budget -= checksum + prefix;
++        copy_budget = budget > SIZE_MAX ? SIZE_MAX : (size_t)budget;
++    }
++    else if (credit / path_x->send_mtu < 2) {
++        return 0;
++    }
+ 
      if (pc == picoquic_packet_context_application &&
          cnx->is_multipath_enabled) {
          for (int i = 0; i < cnx->nb_paths; i++) {
+             pkt_ctx = &cnx->path[i]->pkt_ctx;
+-            ret = picoquic_preemptive_retransmit_in_context(
++            ret = picoquic_preemptive_retransmit_in_context_budget(
+                 cnx, pkt_ctx, rtt, current_time, next_wake_time,
+-                new_bytes, send_buffer_max_minus_checksum, length, &has_data, more_data, is_pure_ack == NULL);
++                new_bytes, send_buffer_max_minus_checksum, length, &has_data, more_data, is_pure_ack == NULL, copy_budget);
+             if (ret != 0 || has_data != 0) {
+                 break;
+             }
+@@ -1459,9 +1522,9 @@
+     }
+     else {
+         pkt_ctx = &cnx->pkt_ctx[pc];
+-        ret = picoquic_preemptive_retransmit_in_context(
++        ret = picoquic_preemptive_retransmit_in_context_budget(
+             cnx, pkt_ctx, rtt, current_time, next_wake_time,
+-            new_bytes, send_buffer_max_minus_checksum, length, &has_data, more_data, is_pure_ack == NULL);
++            new_bytes, send_buffer_max_minus_checksum, length, &has_data, more_data, is_pure_ack == NULL, copy_budget);
+     }
+     
+     if (ret == 0 &&  is_pure_ack != NULL) {
+@@ -3671,8 +3734,17 @@
+                                  * if the packet contains a stream frame, if that stream is finished, and if the
+                                  * data range has not been acked, and it fits: copy it to the data. Move the index to the previous packet.
+                                  */
+-                                 ret = picoquic_preemptive_retransmit_as_needed(cnx, path_x, pc, current_time, next_wake_time, bytes_next,
+-                                    bytes_max - bytes_next, &length, &more_data, &is_pure_ack);
++                                 /* Forced padding keeps its original full-capacity byte
++                                  * semantics and the conservative two-MTU admission. */
++                                 if ((!*is_initial_sent && !is_challenge_padding_needed) ||
++                                     (path_x->send_mtu != 0 &&
++                                      path_x->cwin > path_x->bytes_in_transit &&
++                                      (path_x->cwin - path_x->bytes_in_transit) / path_x->send_mtu >= 2 &&
++                                      cnx->quic->cwin_max > path_x->bytes_in_transit &&
++                                      (cnx->quic->cwin_max - path_x->bytes_in_transit) / path_x->send_mtu >= 2)) {
++                                     ret = picoquic_preemptive_retransmit_as_needed(cnx, path_x, pc, current_time, next_wake_time, bytes_next,
++                                        bytes_max - bytes_next, &length, &more_data, &is_pure_ack);
++                                 }
+                                  if (length > length_before_repeat) {
+                                      preemptive_repeat = 1;
+                                      packet->is_preemptive_repeat = 1;

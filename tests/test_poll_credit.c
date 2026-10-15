@@ -237,7 +237,7 @@ int picoquic_preemptive_retransmit_as_needed(picoquic_cnx_t *, picoquic_path_t *
 static void copy_admission_edges(bool client, int multipath) {
     static const struct { uint64_t cwin; size_t mtu; int copies; } cases[] = {
         {0,143,0}, {142,143,0}, {143,143,0}, {286,143,0},
-        {428,143,0}, {429,143,1}, {UINT64_MAX,143,1}, {1000,0,0}
+        {359,143,0}, {360,143,1}, {428,143,1}, {429,143,1}, {UINT64_MAX,143,1}, {1000,0,0}
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         uint64_t now = 1000000; ss_conn c;
@@ -306,12 +306,12 @@ static void originals_compete(bool client, int multipath, uint64_t cwin) {
         client, multipath, (unsigned long long)cwin, copies,
         (unsigned long long)(stream->sent_offset - before), stream->send_queue != NULL,
         (unsigned long long)path->bytes_in_transit);
-    assert(copies == (cwin == 640 ? 1u : 2u));
+    assert(copies == (cwin == 566 ? 1u : 2u));
     assert(stream->sent_offset - before == sizeof(fresh) && !stream->send_queue);
     assert(path->bytes_in_transit <= cwin);
     assert(first->was_preemptively_repeated);
-    assert(second->was_preemptively_repeated == (cwin != 640));
-    if (cwin == 640) {
+    assert(second->was_preemptively_repeated == (cwin != 566));
+    if (cwin == 566) {
         uint8_t ack[64], *end = ack + sizeof(ack);
         uint8_t *b = picoquic_frames_varint_encode(ack, end,
             multipath ? picoquic_frame_type_path_ack : picoquic_frame_type_ack);
@@ -329,7 +329,7 @@ static void originals_compete(bool client, int multipath, uint64_t cwin) {
         assert(!picoquic_decode_frames(cnx, path, ack, b - ack, NULL, picoquic_epoch_1rtt,
             (struct sockaddr *)&address, (struct sockaddr *)&address, 99, 0, now + 41000));
         assert(path->cwin > path->bytes_in_transit &&
-            (path->cwin - path->bytes_in_transit) / path->send_mtu >= 2);
+            path->cwin - path->bytes_in_transit >= path->send_mtu + 75);
         picoquic_packet_t *resumed = prepare(&c, now + 42000, false); unsigned acks = 0;
         assert(resumed);
         assert(copy_credit_frames(resumed, &acks, old, sizeof(old), sizeof(old)) == 1 && !acks);
@@ -346,6 +346,7 @@ int main(void) {
         interleave(client != 0, 0, true); interleave(client != 0, 1, true);
         edges(client != 0);
         for (int mp = 0; mp < 2; mp++) {
+            originals_compete(client != 0, mp, 566);
             originals_compete(client != 0, mp, 640);
             originals_compete(client != 0, mp, 686);
             originals_compete(client != 0, mp, 1000);

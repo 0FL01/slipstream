@@ -24,6 +24,14 @@ The suites cover:
   at zero, positive and maximum offsets are consumed without adding byte ACKs;
   sparse ranges, duplicates, adjacency, FIN markers, data+FIN, implicit/explicit
   lengths, the 62-bit end boundary and malformed/truncated headers are checked.
+- `poll-credit`: ordinary POLL/ACK interleaving, bounded non-nested early copies,
+  exact admission edges and fresh132 progress at cwin 566/640/686/1000. The 566
+  case retains a genuinely credit-deferred second copy and resumes it via a real ACK.
+- `open-stream-repeat`: open-data/FIN eligibility, suppression, original ownership,
+  early timing, ACK-slot coalescing and cursor preservation across a failed fit.
+- `preemptive-padding`: actual header unprotection and AEAD authentication (including
+  tampered-tag/wrong-path rejection), original/ordinary-recovery padding controls,
+  byte/FIN-once peer delivery, and prospective protected-wire credit boundaries.
 - `server-dns`: actual server decode/encode through SPCDNS wire bytes; in-zone
   IN-class NS/A/AAAA (and other non-TXT) return authoritative NOERROR/NODATA at
   apex and label-boundary subdomains, with case/trailing-dot variants. Non-IN non-TXT,
@@ -55,6 +63,8 @@ and each transport owns at most 64 local flows. Each flow has a 128 KiB receive
 window and a bounded 256 KiB output buffer; receive credit advances only after
 socket writes. Tracked picoquic patches are applied idempotently during Meson
 configuration and reject unexpected source revisions.
+Later overlays can replace earlier hunk context; repeated configuration checks
+the complete applied stack in reverse on a temporary copy, never by undoing live files.
 
 These gates establish local C/C correctness. Cross-implementation interoperability,
 recursive carrier performance and benefit relative to Rust belong to the separate
@@ -123,3 +133,33 @@ The regression uses only synthetic in-memory frames and loopback connection
 addresses. Configure applies all tracked patches only to that export; no raw
 dependency checkout needs editing. This gate does not change transport pins,
 TLS/pinning, media, congestion control, recovery policy or scheduler thresholds.
+
+## Prospective early-copy credit regression
+
+An optional copy must leave one **full output-path MTU** under both `cwin` and
+`cwin_max` after charging its protected wire bytes: the current header/ACK prefix,
+copied frames, tag and capacity-clamped configured/reset minimum padding. This is
+not a compact STREAM encoder: unlimited STREAM leading padding and forced full
+padding remain unchanged. Fresh data, ordinary recovery and non-copy controls
+keep their existing padding policies.
+
+The padding gate measures the real protected output, rejects reserve+wire-1 and
+accepts reserve+wire with ACK and multipath ACK prefixes, PN-width transitions,
+configured/reset minima, limited output capacity, unlimited frames and forced
+padding. A genuine second output path checks its own PN, queue, path IV and
+credit independently from the original's credit-exhausted source path. Fresh132
+is delivered through the real frame decoder out of order and with duplicates;
+the peer must receive all 222 original+fresh bytes exactly once. The original
+packet bytes, ownership, sequence/time and denial cursor assertions remain live.
+
+```sh
+meson test -C <build-dir> poll-credit open-stream-repeat preemptive-padding --print-errorlogs
+meson test -C <sanitizer-build-dir> poll-credit open-stream-repeat preemptive-padding --print-errorlogs
+```
+
+At MTU143, cwin640 now admits two 74/75-byte copies and still sends fresh132
+(flight633). The lower cwin566 case admits only the first copy, sends fresh132
+(flight558), and a genuine ACK releases credit for the deferred second copy.
+The direct 359/360 edges replace the obsolete two-MTU count boundary, not safety
+or fresh-delivery assertions. These in-memory C gates do not establish recursive
+DNS, Android lifecycle or the physical-call long-interval acceptance gate.

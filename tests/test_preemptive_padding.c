@@ -91,16 +91,16 @@ static void padding(picoquic_cnx_t *c, picoquic_packet_t *p, struct stats s,
 /* Actual ready sender -> header unprotection -> actual AEAD decryption with AAD.
  * Also reject a modified authentication tag and (in MP mode) the wrong path IV.
  * Deliberately not a TLS handshake or incoming_packet/network acceptance test. */
-static picoquic_packet_t *protected_prepare(picoquic_cnx_t *c, uint64_t now,
-    size_t capacity, int initial_flag, size_t *sent) {
+static picoquic_packet_t *protected_prepare_path(picoquic_cnx_t *c, picoquic_path_t *path,
+    uint64_t now, size_t capacity, int initial_flag, size_t *sent) {
     uint8_t buffer[1632], plain[1600]; uint8_t *wire=buffer+16;
     assert(capacity <= sizeof(buffer)-32);
     memset(buffer,0xcc,sizeof(buffer));
     uint64_t wake=UINT64_MAX; int initial=initial_flag;
-    c->path[0]->pacing.bucket_nanosec = 1000000000;
+    path->pacing.bucket_nanosec = 1000000000;
     picoquic_packet_t *p = picoquic_create_packet(c->quic); assert(p);
     *sent=0;
-    assert(!picoquic_prepare_packet_ready(c,c->path[0],p,now,wire,capacity,sent,&wake,&initial));
+    assert(!picoquic_prepare_packet_ready(c,path,p,now,wire,capacity,sent,&wake,&initial));
     for (size_t i=0; i<16; i++) assert(buffer[i] == 0xcc);
     for (size_t i=16+capacity; i<sizeof(buffer); i++) assert(buffer[i] == 0xcc);
     if (!*sent) {
@@ -110,30 +110,35 @@ static picoquic_packet_t *protected_prepare(picoquic_cnx_t *c, uint64_t now,
     static const uint8_t secret[32]={1,2,3,4};
     void *dec=picoquic_setup_test_aead_context(0,secret,PICOQUIC_LABEL_QUIC_V1_KEY_BASE); assert(dec);
     picoquic_packet_header ph={0}; ph.ptype=picoquic_packet_1rtt_protected;
-    ph.pn_offset=ph.offset=1+c->path[0]->p_remote_cnxid->cnx_id.id_len;
+    ph.pn_offset=ph.offset=1+path->p_remote_cnxid->cnx_id.id_len;
     ph.payload_length=*sent-ph.offset;
     assert(!picoquic_remove_header_protection_inner(wire,*sent,plain,&ph,
         c->crypto_context[3].pn_enc,0,p->sequence_number ? p->sequence_number-1 : UINT64_MAX));
     assert(ph.pn64 == p->sequence_number && ph.offset == p->offset);
     size_t length = c->is_multipath_enabled ?
         picoquic_aead_decrypt_mp(plain+ph.offset,wire+ph.offset,*sent-ph.offset,
-            c->path[0]->unique_path_id,ph.pn64,plain,ph.offset,dec) :
+            path->unique_path_id,ph.pn64,plain,ph.offset,dec) :
         picoquic_aead_decrypt_generic(plain+ph.offset,wire+ph.offset,*sent-ph.offset,
             ph.pn64,plain,ph.offset,dec);
     assert(length == p->length-p->offset && !memcmp(plain+ph.offset,p->bytes+p->offset,length));
     wire[*sent-1] ^= 1;
     length = c->is_multipath_enabled ?
         picoquic_aead_decrypt_mp(plain+ph.offset,wire+ph.offset,*sent-ph.offset,
-            c->path[0]->unique_path_id,ph.pn64,plain,ph.offset,dec) :
+            path->unique_path_id,ph.pn64,plain,ph.offset,dec) :
         picoquic_aead_decrypt_generic(plain+ph.offset,wire+ph.offset,*sent-ph.offset,
             ph.pn64,plain,ph.offset,dec);
     assert(length > *sent); wire[*sent-1] ^= 1;
     if (c->is_multipath_enabled) {
         assert(picoquic_aead_decrypt_mp(plain+ph.offset,wire+ph.offset,*sent-ph.offset,
-            c->path[0]->unique_path_id+1,ph.pn64,plain,ph.offset,dec) > *sent);
+            path->unique_path_id+1,ph.pn64,plain,ph.offset,dec) > *sent);
     }
     picoquic_aead_free(dec); authenticated++;
     return p;
+}
+
+static picoquic_packet_t *protected_prepare(picoquic_cnx_t *c, uint64_t now,
+    size_t capacity, int initial_flag, size_t *sent) {
+    return protected_prepare_path(c,c->path[0],now,capacity,initial_flag,sent);
 }
 
 static void require_ack(picoquic_cnx_t *c, uint64_t now) {
@@ -308,6 +313,152 @@ static void unlimited_slack(int mp, size_t mtu) {
     cases++; picoquic_free(c->quic);
 }
 
+/* Observe the actual protected wire, then deny at reserve+wire-1 and admit at
+ * reserve+wire. This exercises the real sender, not a duplicate size formula.
+ * ACK prefixes, PN widths, both credit limits and cap-clamped/reset minima are
+ * included. Unlimited frames retain their leading padding; forced packets must
+ * still consume a full MTU. Denial must leave the original and cursor intact. */
+static void credit_edge(int mp, uint64_t pn, int ack, int maximum, uint32_t minimum,
+    size_t capacity, size_t n, int fin, int unlimited, int forced) {
+    size_t observed=0;
+    for (int pass=0; pass<3; pass++) {
+        uint64_t now=1000000; picoquic_cnx_t *c=sender(&now,mp,143,minimum,128);
+        picoquic_path_t *path=c->path[0]; picoquic_packet_context_t *ctx=context(c);
+        ctx->send_sequence=pn; ctx->next_sequence_hole=UINT64_MAX;
+        add_data(c,0,n,fin);
+        size_t original_capacity=unlimited ?
+            picoquic_predict_packet_header_length(c,picoquic_packet_1rtt_protected,ctx)+2+n+16 : 143;
+        size_t wire;
+        picoquic_packet_t *original=protected_prepare(c,now,original_capacity,0,&wire); assert(original);
+        if (unlimited) assert(picoquic_is_stream_frame_unlimited(original->bytes+original->offset));
+        uint8_t saved[1600]; size_t saved_n=original->length; memcpy(saved,original->bytes,saved_n);
+        picoquic_packet_t *cursor=ctx->preemptive_repeat_ptr;
+        uint64_t flight=path->bytes_in_transit, time=original->send_time, number=original->sequence_number;
+        if (ack) require_ack(c,now+35001);
+        uint64_t credit=pass ? 143+observed-(pass == 1) : 10000;
+        uint64_t limit=flight+credit;
+        path->cwin=maximum ? UINT64_MAX : limit;
+        if (maximum) c->quic->cwin_max=limit;
+        picoquic_packet_t *copy=protected_prepare(c,now+35001,capacity,forced,&wire);
+        if (pass == 1) {
+            assert(!copy || !copy->is_preemptive_repeat);
+            assert(!original->was_preemptively_repeated && !c->nb_preemptive_repeat);
+            assert(ctx->preemptive_repeat_ptr == cursor);
+            if (copy) { struct stats s=inspect(copy,0,0,0); assert(!s.streams); padding(c,copy,s,capacity,forced); }
+        } else {
+            assert(copy && copy->is_preemptive_repeat && original->was_preemptively_repeated);
+            assert(c->nb_preemptive_repeat == 1 && path->bytes_in_transit == flight+wire);
+            struct stats s=inspect(copy,0,n,fin);
+            assert(s.streams == 1 && s.acks == (unsigned)ack);
+            if (unlimited) {
+                assert(copy->length == capacity-copy->checksum_overhead && s.pads > 0);
+                assert(s.pads == copy->length-copy->offset-(2+n));
+                assert(picoquic_is_stream_frame_unlimited(copy->bytes+copy->offset+s.pads));
+            } else padding(c,copy,s,capacity,forced);
+            if (!pass) observed=wire;
+            else assert(wire == observed && limit-path->bytes_in_transit == 143);
+            if (unlimited || forced) assert(wire == 143);
+            peer_once(c,now,NULL,0,copy->bytes+copy->offset,copy->length-copy->offset,
+                saved+original->offset,saved_n-original->offset,n,fin);
+        }
+        assert(original->length == saved_n && !memcmp(saved,original->bytes,saved_n));
+        assert(original->sequence_number == number && original->send_time == time);
+        assert(ctx->pending_first == original && original->is_queued_for_retransmit);
+        picoquic_free(c->quic);
+    }
+    printf("CREDIT mp=%d pn=%llu ACK=%d max=%d min=%u cap=%zu unlimited=%d forced=%d wire=%zu exact-reserve=143\n",
+        mp,(unsigned long long)pn,ack,maximum,minimum,capacity,unlimited,forced,observed);
+    cases++;
+}
+
+/* Fresh132 delivery, not just sent_offset: receive fresh ranges out of order,
+ * then copies/originals/duplicate fresh, and require every byte exactly once. */
+static void credit_fresh_delivery(int mp, uint64_t cwin, unsigned expected) {
+    uint64_t now=1000000; picoquic_cnx_t *c=sender(&now,mp,143,39,128); size_t wire;
+    add_data(c,0,45,0); picoquic_packet_t *a=protected_prepare(c,now,143,0,&wire); assert(a && wire == 143);
+    add_data(c,45,45,0); picoquic_packet_t *b=protected_prepare(c,now+4000,143,0,&wire); assert(b && wire == 143);
+    uint8_t sa[1600], sb[1600]; size_t an=a->length, bn=b->length;
+    memcpy(sa,a->bytes,an); memcpy(sb,b->bytes,bn); c->path[0]->cwin=cwin;
+    picoquic_packet_t *copies[2]={0}; unsigned count=0;
+    for (unsigned i=0; i<2; i++) {
+        uint64_t before=c->path[0]->bytes_in_transit;
+        picoquic_packet_t *x=protected_prepare(c,now+35001+i*4000,143,0,&wire);
+        if (x) {
+            assert(x->is_preemptive_repeat && wire == (i ? 75u : 74u));
+            assert(cwin-before >= 143+wire && cwin-c->path[0]->bytes_in_transit >= 143);
+            copies[count++]=x;
+        }
+    }
+    assert(count == expected && c->nb_preemptive_repeat == expected);
+    add_data(c,90,132,0); picoquic_stream_head_t *stream=picoquic_find_stream(c,0);
+    picoquic_packet_t *fresh[4]={0}; unsigned nf=0;
+    for (unsigned i=0; i<4 && stream->send_queue; i++) {
+        picoquic_packet_t *x=protected_prepare(c,now+40000+i,143,0,&wire);
+        assert(x && !x->is_preemptive_repeat && c->path[0]->bytes_in_transit <= cwin); fresh[nf++]=x;
+    }
+    assert(!stream->send_queue && stream->sent_offset == 222);
+    assert(a->length == an && b->length == bn && !memcmp(sa,a->bytes,an) && !memcmp(sb,b->bytes,bn));
+    struct sink sink={0}; picoquic_cnx_t *peer=connection_mode(&now,0,mp);
+    context(peer)->send_sequence=1; picoquic_set_callback(peer,sink_data,&sink);
+    for (unsigned i=nf; i>0; i--) decode(peer,fresh[i-1]->bytes+fresh[i-1]->offset,
+        fresh[i-1]->length-fresh[i-1]->offset,now+i);
+    for (unsigned i=count; i>0; i--) decode(peer,copies[i-1]->bytes+copies[i-1]->offset,
+        copies[i-1]->length-copies[i-1]->offset,now+10+i);
+    decode(peer,sa+a->offset,an-a->offset,now+20); decode(peer,sb+b->offset,bn-b->offset,now+21);
+    for (unsigned i=0; i<nf; i++) decode(peer,fresh[i]->bytes+fresh[i]->offset,
+        fresh[i]->length-fresh[i]->offset,now+30+i);
+    assert(sink.length == 222 && !sink.fins);
+    for (size_t i=0; i<sink.length; i++) assert(sink.bytes[i] == datum(i));
+    printf("CREDIT_FRESH mp=%d cwin=%llu copies=%u fresh132 peer-exactly-once flight=%llu\n",
+        mp,(unsigned long long)cwin,count,(unsigned long long)c->path[0]->bytes_in_transit);
+    cases++; picoquic_free(peer->quic); picoquic_free(c->quic);
+}
+
+/* A genuine second output path has its own PN/header, credit, queue and AEAD
+ * path IV. The original's source path has NO credit; it must not be charged. */
+static void cross_path_credit(int source_index, int maximum) {
+    for (int delta=-1; delta<=0; delta++) {
+        uint64_t now=1000000; picoquic_cnx_t *c=sender(&now,1,143,39,128);
+        struct sockaddr_in address={0}; address.sin_family=AF_INET;
+        address.sin_addr.s_addr=htonl(INADDR_LOOPBACK); address.sin_port=htons(54);
+        assert(picoquic_create_path(c,now,(struct sockaddr *)&address,(struct sockaddr *)&address,1) == 1);
+        picoquic_path_t *p1=c->path[1]; uint8_t cid[8]={0xa7}, secret[16]={0};
+        assert(!picoquic_stash_remote_cnxid(c,0,1,0,sizeof(cid),cid,secret,NULL));
+        assert(!picoquic_assign_peer_cnxid_to_path(c,1));
+        p1->p_local_cnxid=picoquic_create_local_cnxid(c,1,NULL,now); assert(p1->p_local_cnxid);
+        p1->challenge_verified=1; p1->response_required=0; p1->send_mtu=143;
+        p1->latest_sent_time=now; p1->rtt_min=p1->smoothed_rtt=140000;
+        p1->rtt_is_initialized=1; p1->retransmit_timer=1000000; p1->cwin=10000; p1->pacing.rate=1000000;
+        picoquic_path_t *src=c->path[source_index], *out=c->path[!source_index];
+        out->pkt_ctx.send_sequence=16; out->pkt_ctx.next_sequence_hole=UINT64_MAX;
+        add_data(c,0,45,0); size_t wire;
+        picoquic_packet_t *original=protected_prepare_path(c,src,now,143,0,&wire); assert(original && wire == 143);
+        uint8_t saved[1600]; size_t sn=original->length; memcpy(saved,original->bytes,sn);
+        picoquic_packet_t *cursor=src->pkt_ctx.preemptive_repeat_ptr;
+        uint64_t flight=src->bytes_in_transit; src->cwin=flight;
+        out->cwin=218+delta; /* 2-byte output PN: protected copy is 75 bytes. */
+        if (maximum) { c->quic->cwin_max=out->cwin; out->cwin=UINT64_MAX; }
+        picoquic_packet_t *copy=protected_prepare_path(c,out,now+35001,143,0,&wire);
+        if (delta < 0) {
+            assert(!copy && !wire && !original->was_preemptively_repeated && !c->nb_preemptive_repeat);
+            assert(src->pkt_ctx.preemptive_repeat_ptr == cursor);
+        } else {
+            assert(copy && copy->is_preemptive_repeat && wire == 75 && copy->send_path == out);
+            assert(original->was_preemptively_repeated && c->nb_preemptive_repeat == 1);
+            assert(src->bytes_in_transit == flight && out->bytes_in_transit == 75);
+            assert((maximum ? c->quic->cwin_max : out->cwin)-out->bytes_in_transit == 143);
+            assert(out->pkt_ctx.pending_last == copy && src->pkt_ctx.pending_first == original);
+            peer_once(c,now,NULL,0,copy->bytes+copy->offset,copy->length-copy->offset,
+                original->bytes+original->offset,original->length-original->offset,45,0);
+        }
+        assert(original->length == sn && !memcmp(saved,original->bytes,sn));
+        printf("CROSS_PATH source=%d max=%d credit=%d copy=%d source-flight=%llu output-flight=%llu\n",
+            source_index,maximum,218+delta,delta == 0,
+            (unsigned long long)src->bytes_in_transit,(unsigned long long)out->bytes_in_transit);
+        cases++; picoquic_free(c->quic);
+    }
+}
+
 int main(void) {
     printf("Early-copy padding reset-min=%d (plaintext packet minimum, before tag)\n",PICOQUIC_RESET_PACKET_MIN_SIZE);
     const size_t small[]={1,11,45,63,64,100};
@@ -337,7 +488,22 @@ int main(void) {
         for (int kind=0; kind<4; kind++) control(mp,kind);
         unlimited_control(mp);
         unlimited_slack(mp,143); unlimited_slack(mp,1500);
+        for (int maximum=0; maximum<=1; maximum++) {
+            for (int ack=0; ack<=1; ack++) {
+                const uint64_t pn[]={0,15,1023,262144};
+                for (size_t i=0; i<sizeof(pn)/sizeof(pn[0]); i++)
+                    credit_edge(mp,pn[i],ack,maximum,39,143,45,0,0,0);
+                credit_edge(mp,0,ack,maximum,80,143,1,0,0,0);
+                credit_edge(mp,0,ack,maximum,300,100,1,0,0,0);
+                credit_edge(mp,0,ack,maximum,0,143,0,1,0,0);
+            }
+            credit_edge(mp,0,0,maximum,39,143,45,1,1,0);
+            credit_edge(mp,0,0,maximum,39,143,45,0,0,1);
+        }
+        credit_fresh_delivery(mp,640,2); credit_fresh_delivery(mp,566,1);
     }
+    for (int source_index=0; source_index<2; source_index++)
+        for (int maximum=0; maximum<2; maximum++) cross_path_credit(source_index,maximum);
     printf("STRICT PASS cases=%u authenticated-and-tamper-rejected=%u real peer byte/FIN once\n",cases,authenticated);
     return 0;
 }

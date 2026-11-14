@@ -5,6 +5,7 @@ mod pacing;
 mod pinning;
 mod runtime;
 mod streams;
+mod tcp_bridge;
 
 use clap::{parser::ValueSource, ArgGroup, CommandFactory, FromArgMatches, Parser};
 use slipstream_core::{
@@ -24,7 +25,7 @@ use runtime::run_client;
     group(
         ArgGroup::new("resolvers")
             .multiple(true)
-            .args(["resolver", "authoritative"])
+            .args(["resolver", "authoritative", "authoritative_tcp"])
     )
 )]
 struct Args {
@@ -42,6 +43,18 @@ struct Args {
     congestion_control: Option<String>,
     #[arg(long = "authoritative", value_parser = parse_resolver)]
     authoritative: Vec<HostPort>,
+    /// Authoritative mode through a recursive resolver over DNS-over-TCP (in-process bridge).
+    #[arg(long = "authoritative-tcp", value_parser = parse_resolver)]
+    authoritative_tcp: Vec<HostPort>,
+    /// Aggregate TCP connections across all --authoritative-tcp paths.
+    #[arg(long = "tcp-lanes", default_value_t = 56)]
+    tcp_lanes: usize,
+    /// Outstanding exchanges per TCP connection.
+    #[arg(long = "tcp-depth", default_value_t = 1)]
+    tcp_depth: usize,
+    /// Aggregate pending-query queue across all --authoritative-tcp paths.
+    #[arg(long = "tcp-queue", default_value_t = 64)]
+    tcp_queue: usize,
     #[arg(
         short = 'g',
         long = "gso",
@@ -111,7 +124,8 @@ fn main() {
 
     let cli_has_resolvers = has_cli_resolvers(&matches);
     let resolvers = if cli_has_resolvers {
-        build_resolvers(&matches, true).unwrap_or_else(|err| {
+        let bridge = (args.tcp_lanes, args.tcp_depth, args.tcp_queue);
+        build_resolvers(&matches, true, bridge).unwrap_or_else(|err| {
             tracing::error!("Resolver error: {}", err);
             std::process::exit(2);
         })
@@ -244,7 +258,11 @@ fn parse_resolver(input: &str) -> Result<HostPort, String> {
     parse_host_port(input, 53, AddressKind::Resolver).map_err(|err| err.to_string())
 }
 
-fn build_resolvers(matches: &clap::ArgMatches, require: bool) -> Result<Vec<ResolverSpec>, String> {
+fn build_resolvers(
+    matches: &clap::ArgMatches,
+    require: bool,
+    (lanes, depth, queue): (usize, usize, usize),
+) -> Result<Vec<ResolverSpec>, String> {
     let mut ordered = Vec::new();
     collect_resolvers(matches, "resolver", ResolverMode::Recursive, &mut ordered)?;
     collect_resolvers(
@@ -253,6 +271,31 @@ fn build_resolvers(matches: &clap::ArgMatches, require: bool) -> Result<Vec<Reso
         ResolverMode::Authoritative,
         &mut ordered,
     )?;
+    let mut tcp = Vec::new();
+    collect_resolvers(
+        matches,
+        "authoritative_tcp",
+        ResolverMode::Authoritative,
+        &mut tcp,
+    )?;
+    if !tcp.is_empty() {
+        let paths = tcp.len();
+        if lanes < paths || queue < paths || depth == 0 {
+            return Err("--tcp-lanes/--tcp-queue must cover every TCP path; --tcp-depth > 0".into());
+        }
+        for (idx, spec) in tcp {
+            let target = resolve_socket_addr(&spec.resolver)?;
+            let config = tcp_bridge::BridgeConfig {
+                lanes: lanes / paths,
+                depth,
+                queue: queue / paths,
+            };
+            let local = tcp_bridge::spawn(target, config).map_err(|err| err.to_string())?;
+            let resolver = parse_host_port(&local.to_string(), 53, AddressKind::Resolver)
+                .map_err(|err| err.to_string())?;
+            ordered.push((idx, ResolverSpec { resolver, mode: spec.mode }));
+        }
+    }
     if ordered.is_empty() && require {
         return Err("At least one resolver is required".to_string());
     }
@@ -282,6 +325,15 @@ fn collect_resolvers(
     Ok(())
 }
 
+fn resolve_socket_addr(host_port: &HostPort) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    (host_port.host.as_str(), host_port.port)
+        .to_socket_addrs()
+        .map_err(|err| err.to_string())?
+        .next()
+        .ok_or_else(|| format!("Cannot resolve {}", host_port.host))
+}
+
 fn cli_provided(matches: &clap::ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
@@ -293,6 +345,10 @@ fn has_cli_resolvers(matches: &clap::ArgMatches) -> bool {
         .unwrap_or(false)
         || matches
             .get_many::<HostPort>("authoritative")
+            .map(|values| values.len() > 0)
+            .unwrap_or(false)
+        || matches
+            .get_many::<HostPort>("authoritative_tcp")
             .map(|values| values.len() > 0)
             .unwrap_or(false)
 }
@@ -404,7 +460,7 @@ mod tests {
                 "3.3.3.3:5353",
             ])
             .expect("matches should parse");
-        let resolvers = build_resolvers(&matches, true).expect("resolvers should parse");
+        let resolvers = build_resolvers(&matches, true, (56, 1, 64)).expect("resolvers should parse");
         assert_eq!(resolvers.len(), 3);
         assert_eq!(resolvers[0].resolver.host, "1.1.1.1");
         assert_eq!(resolvers[0].resolver.port, 53);
@@ -428,7 +484,7 @@ mod tests {
                 "9.9.9.9",
             ])
             .expect("matches should parse");
-        let resolvers = build_resolvers(&matches, true).expect("resolvers should parse");
+        let resolvers = build_resolvers(&matches, true, (56, 1, 64)).expect("resolvers should parse");
         assert_eq!(resolvers.len(), 2);
         assert_eq!(resolvers[0].resolver.host, "8.8.8.8");
         assert_eq!(resolvers[0].mode, ResolverMode::Authoritative);

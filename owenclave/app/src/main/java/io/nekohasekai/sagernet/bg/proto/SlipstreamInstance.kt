@@ -44,6 +44,11 @@ internal class SlipstreamInstance(
     private companion object {
         const val WORKERS = 56
         const val QUERY_QUEUE_CAPACITY = 64
+        // Native in-process TCP bridge budget per TCP path. Phone LTE screen 2026-11-14:
+        // 112 serial connections per resolver ~1.9x download of 56 at equal latency.
+        const val NATIVE_TCP_LANES_PER_PATH = 112
+        const val NATIVE_TCP_DEPTH = 1
+        const val NATIVE_TCP_QUEUE_PER_PATH = 128
         const val QUERY_MAX_AGE_MS = 10_000L
         const val SOCKET_TIMEOUT_MS = 8_000
     }
@@ -246,7 +251,7 @@ internal class SlipstreamInstance(
             "--cert", certificate.absolutePath,
             "--congestion-control", "dcubic",
             "--flow-relay-stdin",
-        ) + authorities.flatMap { listOf("--authoritative", it) }
+        ) + authorities
         val child = ProcessBuilder(command)
             .directory(SagerNet.application.noBackupFilesDir)
             .start()
@@ -292,15 +297,18 @@ internal class SlipstreamInstance(
             }
             try {
                 val paths = resolver.paths()
-                authorities = paths.map { path ->
+                authorities = paths.flatMap { path ->
                     when (path.transport) {
-                        "udp" -> joinHostPort(path.host, path.port)
-                        "tcp" -> DnsTcpAdapter(path.host, path.port, WORKERS / paths.size, QUERY_QUEUE_CAPACITY / paths.size).let {
-                            adapters.add(it)
-                            "127.0.0.1:${it.port}"
-                        }
+                        "udp" -> listOf("--authoritative", joinHostPort(path.host, path.port))
+                        "tcp" -> listOf("--authoritative-tcp", joinHostPort(path.host, path.port))
                         else -> throw IOException("Unsupported DNS resolver transport")
                     }
+                } + paths.count { it.transport == "tcp" }.let { tcpPaths ->
+                    if (tcpPaths == 0) emptyList() else listOf(
+                        "--tcp-lanes", (NATIVE_TCP_LANES_PER_PATH * tcpPaths).toString(),
+                        "--tcp-depth", NATIVE_TCP_DEPTH.toString(),
+                        "--tcp-queue", (NATIVE_TCP_QUEUE_PER_PATH * tcpPaths).toString(),
+                    )
                 }
                 startLocked()
             } catch (error: Throwable) {

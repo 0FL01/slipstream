@@ -104,6 +104,9 @@ Otherwise, the response is ignored (including NAME_ERROR, which signals no data)
   avoid connection-level stalls.
 - Once a connection enters multi-stream mode it stays there for the remainder
   of the connection.
+- A received RESET_STREAM consumes the abandoned remainder up to its validated
+  final size exactly once, including bytes not delivered before cancellation,
+  so cancelled streams do not permanently exhaust connection-level max_data.
 
 ## Path handling
 

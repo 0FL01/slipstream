@@ -152,13 +152,15 @@ satisfied.
 - Target: C server crash fix (`slipstream-c/src/`, its picoquic), native TCP-DNS adapter in
   `slipstream-rust/crates/slipstream-client` (replacing the Kotlin blocking adapter path in
   `SlipstreamInstance.kt`), adapter lane count / pipelining depth, server QUIC MTU.
+- Repair extension justified by reproduced R5 starvation: Rust vendor picoquic RESET_STREAM
+  receive-credit accounting and the nearest existing FFI backpressure regression test.
 - Direct consumers: `owenclave/.../SlipstreamInstance.kt`, `DnsttFmt.kt`, `bin/lib/slipstream/smoke/`.
 - Allowed: source, unit tests, smoke harness options, this document. Forbidden: committed secrets,
   generated jniLibs/APKs, new external services.
 - Budget: none stated.
 
 ## Current Checkpoint
-- Closes: R1 (locally reproduced production abort and candidate fix).
+- Closes: reproduced R5 cancellation-induced starvation; R1 observation remains open.
 - Next: observe seven crash-free days from 2026-11-14 19:02:22 UTC, then request drop-in removal/restart.
   Deployment retained default MTU 900; Yandex 900→1200 A/B is a subsequent approved experiment.
 - R1: coredump capture active on n-de1 since 2026-11-14 14:35 CET (drop-in
@@ -169,13 +171,58 @@ satisfied.
   Any next abort leaves `/var/lib/slipstream/core` (0600, contains key material: analyse on host only,
   `gdb` against the unstripped production binary, then delete).
 - Remove the drop-in only after seven crash-free days after deployment, with restart approval.
-- R5: permanent DIRECT cutover passed bounded phone website/TCP/UDP acceptance. Remaining:
-  reproduce/fix automatic recovery of a stuck client and repeat the frozen 30-minute video session.
+- R5: DIRECT cutover and reset-credit fix passed the bounded phone tests below. Remaining:
+  separate network/server-restart recovery qualification and the frozen 30-minute video session.
   No further WARP changes needed for this path; do not change MTU/resolver choice to mask unrelated failures.
+- Active repair checkpoint (user reports another full outage on DIRECT): same production phone VPN/native
+  child remained alive, while literal-IP HTTPS timed out; server services active with zero restarts.
+  A clean phone restart restored traffic. Bounded baseline load then passed 240 page fetches + six 4MiB
+  downloads; 20 rounds of three deliberately cancelled downloads + one recovery page also passed recovery.
+  Harnesses/evidence outside Git: `dns-browse-load.py`, `dns-load-before-20261114.jsonl`,
+  `dns-cancel-load.py`, `dns-cancel-before-20261114.jsonl` under `/home/stfu/.cache/opencode-tmp/opencode/`.
+  These initial passes did not invalidate the observed outage; the longer cancellation run below reproduced it.
+- Confirmed local defect: Rust vendor picoquic RESET_STREAM charges final size to data_received but
+  does not consume discarded bytes, leaking connection receive credit. Existing FFI backpressure test
+  extended with valid reset-before-data/repeated-reset case: fails before fix (received8192, consumed not8192),
+  passes after releasing the abandoned credit before callbacks. Test command:
+  `CC=/usr/bin/clang CXX=/usr/bin/clang++ CARGO_TARGET_DIR=/home/stfu/.cache/opencode-tmp/opencode/ss-reset-credit-target cargo test -p slipstream-ffi --test backpressure --features picoquic-minimal-build`.
+  CMake library required explicit rebuild before relink (Cargo does not track vendor source edits).
+  FFI package tests passed after the fix. Real-phone before/after evidence follows below.
+- Reachable phone reproduction confirmed on the old signed APK: after the ordinary load, 20 cancellation
+  rounds and a passing 130-second idle check, a longer cancellation run stalled at zero-based round41
+  (Wikipedia body stopped at81911 bytes), then rounds42/43 could not establish any connection.
+  Harness stopped after three failed recovery probes. Evidence: `dns-cancel-long-before-20261114.jsonl`.
+  Each round has three concurrent 4MiB downloads cancelled at0.8s, one second pause, then a recovery page
+  with8s deadline. Server NRestarts stayed0 and direct server Wikipedia control returned200 in0.276s.
+  This is the before-fix failure point for the same-session comparison.
+- Candidate built with Rust1.97.1/cargo-ndk4.1.2/NDK29 in Debian13 after separating the host picoquic
+  test cache from Android libs. ELF SHA-256 `5744e35d7dfca300b875a7e0b910b235ac47803748d98d0dbbf97575fc54cfda`.
+  Release APK signed with the existing signer, alignment checked, installed over production via ADB.
+  Trial began with native PID17828, direct IP/warp=off verified. Output filenames:
+  `dns-load-after-20261114.jsonl`, `dns-cancel-after-20261114.jsonl`,
+  `dns-cancel-long-after-20261114.jsonl` in the same external cache directory.
+  User chose publishing this mobile workspace to a separate branch of `0FL01/slipstream`, not server main.
+- First candidate load result: 245/246 required transfers passed. Google round15 failed with curl35
+  during TLS after0.214s, not a timeout; simultaneous pages and all later rounds passed. Native PID17828
+  unchanged, literal-IP HTTPS control still200 in0.409s. Error text was not retained by the first harness,
+  so attribution is unknown, not dismissed as external. Harness now records bounded curl error text for
+  the fixed public test endpoints. No code change was justified solely by that isolated TLS failure.
+- Final candidate comparison, SAME native PID17828 throughout, no VPN restart: short cancellation recovery
+  20/20, 130s pause, long cancellation recovery120/120 (360 intentionally timed-out downloads), then
+  confirming page/load run246/246. HTTP status codes checked (200/204), six load bodies exactly4MiB each.
+  Confirming240 pages p50/p95/max0.690/1.323/1.844s; six4MiB downloads7.27–11.30s under concurrent browsing.
+  Final direct public IP/warp=off rechecked, Brave rendered Wikipedia. Confirming output:
+  `dns-load-confirm-after-20261114.jsonl`. The isolated first-pass TLS error remains a recorded residual;
+  do not claim all possible connection failures or the full frozen R5 video gate are resolved.
+- Accepted release APK replaces `/home/stfu/Torrents/apk/Owenclave-0.17.50-native-bridge-arm64-v8a.apk`;
+  SHA-256 `35bc7273a927c8925dea4f5cefc6192c02162fa6a69a9acd76ba8ae5edd54365`.
+  Signing certificate unchanged, v1/v2/v3 and16KiB alignment verified. Installed on production package;
+  debug VPN stopped. Server code/config was not changed in this client-fix iteration.
 
 ## Current State
-- Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Handover reports debug VPN running;
-  current phone state has not been rechecked.
+- Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Phone runs the signed reset-credit-fixed
+  production APK on DIRECT; debug VPN stopped. Published workspace branch: `mobile/dns-reset-credit`
+  in `0FL01/slipstream` (separate layout/history from the C-server main branch).
 - Lab setup (reproducible): debug APK `org.owenewans.owenclave.debug` installs beside production
   (debug signing; profile `lab`, `tcp+mp://77.88.8.88:53`). Native ELF built in `rust:1.97.1-bookworm`
   with NDK 29.0.14206865 via `owenclave/bin/lib/slipstream/build.sh` (host lacks Perl FindBin);

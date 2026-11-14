@@ -304,6 +304,11 @@ const uint8_t* picoquic_decode_stream_reset_frame(picoquic_cnx_t* cnx, const uin
         stream->reset_received = 1;
         stream->remote_error  = error_code_64;
 
+        /* Reset discards the receive remainder, including data that never arrived.
+         * Release its connection credit before callbacks can remove the stream. */
+        cnx->data_consumed += stream->fin_offset - stream->consumed_offset;
+        stream->consumed_offset = stream->fin_offset;
+
         picoquic_update_max_stream_ID_local(cnx, stream);
 
         if (cnx->callback_fn != NULL && !stream->reset_signalled) {

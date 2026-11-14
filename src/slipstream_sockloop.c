@@ -206,8 +206,9 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
                     /* Resolve identity again: previous reply preparation can delete paths. */
                     slot->path_id = picoquic_get_path_id_from_unique(slot->cnx, slot->unique_path_id);
                     if (slot->path_id < 0) continue;
+                    size_t cap = (slot->max_quic && slot->max_quic < send_buffer_size) ? slot->max_quic : send_buffer_size;
                     ret = picoquic_prepare_packet_ex(slot->cnx, slot->path_id, loop_time,
-                        send_buffer, send_buffer_size, &send_length,
+                        send_buffer, cap, &send_length,
                         &peer_addr, &local_addr, &if_index, send_msg_ptr);
                 }
                 else if (param->is_client) {

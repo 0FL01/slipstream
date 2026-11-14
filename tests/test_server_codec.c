@@ -39,6 +39,44 @@ static void empty_response(const char *name, dns_type_t type, dns_rcode_t expect
     free(response);
 }
 
+/* A reply carrying exactly max_quic bytes must fit the requester's EDNS size. */
+static void reply_fits(size_t labels_len, int edns) {
+    char name[300]; size_t at = 0;
+    while (at + 1 < labels_len) {
+        size_t run = labels_len - at - 1 > 57 ? 57 : labels_len - at - 1;
+        memset(name + at, 'a', run); at += run; name[at++] = '.';
+    }
+    strcpy(name + at, "t.test.");
+    slot_t slot = {0};
+    dns_question_t question = {0};
+    question.name = name; question.type = RR_TXT; question.class = CLASS_IN;
+    dns_answer_t opt = {0};
+    opt.opt.name = "."; opt.opt.type = RR_OPT; opt.opt.udp_payload = (size_t)edns;
+    dns_query_t query = {0};
+    query.id = 7; query.query = true; query.qdcount = 1; query.questions = &question;
+    if (edns) { query.arcount = 1; query.additional = &opt; }
+    unsigned char packet[MAX_UDP_PACKET_SIZE];
+    size_t size = sizeof(packet);
+    assert(dns_encode((dns_packet_t *)packet, &size, &query) == RCODE_OKAY);
+    struct sockaddr_storage peer = {0}, local = {0};
+    peer.ss_family = AF_INET; local.ss_family = AF_INET;
+    unsigned char *decoded = NULL;
+    (void)server_decode(&slot, NULL, &decoded, packet, size, &peer, &local);
+    free(decoded);
+    assert(slot.max_quic > 0);
+    unsigned char payload[MAX_UDP_PACKET_SIZE];
+    memset(payload, 0x5a, sizeof(payload));
+    slot.error = RCODE_OKAY;
+    unsigned char *response = NULL;
+    ssize_t length = server_encode(&slot, NULL, &response, payload, slot.max_quic, NULL, &peer, &local);
+    size_t limit = edns ? (size_t)edns : 512;
+    if (limit > MAX_UDP_PACKET_SIZE - 12) limit = MAX_UDP_PACKET_SIZE - 12;
+    assert(length > 0 && (size_t)length <= limit);
+    /* The cap is tight: a few more bytes would not have fitted. */
+    assert((size_t)length + 16 > limit);
+    free(response);
+}
+
 int main(void) {
     const char *domains[] = {"t.test"};
     server_domains = domains; server_domain_count = 1;
@@ -46,5 +84,10 @@ int main(void) {
     empty_response("aa.untrusted.test.", RR_TXT, RCODE_NAME_ERROR);
     empty_response("aa.t.test.", RR_A, RCODE_NAME_ERROR);
     empty_response("00.t.test.", RR_TXT, RCODE_NAME_ERROR);
+    reply_fits(240, 1232);
+    reply_fits(60, 1232);
+    reply_fits(240, 4096);
+    reply_fits(60, 4096);
+    reply_fits(60, 0);
     return 0;
 }

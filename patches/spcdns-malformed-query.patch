@@ -1,0 +1,30 @@
+diff --git a/src/codec.c b/src/codec.c
+index 9025786..bb147cf 100644
+--- a/src/codec.c
++++ b/src/codec.c
+@@ -182,0 +183,3 @@ typedef struct ddns_context
++  /* An exhausted block (size == 0) is a normal state at the end of a packet or
++   * decode pool; callers check sizes before reading. Asserting size > 0 let a
++   * header-only query (QDCOUNT=1, 12 bytes) abort the authoritative server. */
+@@ -187 +189,0 @@ typedef struct ddns_context
+-    assert(block->size >  0);
+@@ -194 +195,0 @@ typedef struct ddns_context
+-    assert(block.size >  0);
+@@ -1158,4 +1159,4 @@ static inline uint32_t read_uint32(block__s *parse)
+-  val = (parse->ptr[0] << 24)
+-      | (parse->ptr[1] << 16)
+-      | (parse->ptr[2] <<  8)
+-      | (parse->ptr[3]      );
++  val = ((uint32_t)parse->ptr[0] << 24)
++      | ((uint32_t)parse->ptr[1] << 16)
++      | ((uint32_t)parse->ptr[2] <<  8)
++      | ((uint32_t)parse->ptr[3]      );
+@@ -1922 +1923,4 @@ static inline dns_rcode_t decode_rr_opt(
+-    assert(len > 4);
++
++    /* Malformed OPT RDATA from the network is a format error, not an abort. */
++    if (len < 4 || len > data->parse.size)
++      return RCODE_FORMAT_ERROR;
+@@ -1927,0 +1932,2 @@ static inline dns_rcode_t decode_rr_opt(
++      if (length < 4)
++        return RCODE_FORMAT_ERROR;

@@ -13,6 +13,7 @@ typedef struct st_slot_t {
     int path_id;
     uint64_t unique_path_id;
     bool is_poll_packet;
+    size_t max_quic; /* per-query QUIC payload cap from EDNS size and question; 0 = none */
 } slot_t;
 
 #endif // SLIPSTREAM_SLOT

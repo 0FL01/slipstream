@@ -49,7 +49,8 @@ satisfied.
     32-bit decoding shifts. This proves a production crash trigger, not attribution of all historical exits.
     Fresh Clang ASan/UBSan Meson suite: 7/7 passed, including codec, 200,000 deterministic mutations
     plus truncations, and runtime transport/multipath checks (56.65 s).
-    Deployment and the seven-day crash-free observation remain outstanding.
+    Deployed with explicit approval at 2026-11-14 19:02:22 UTC; server-side smoke passed.
+    Seven-day crash-free observation remains outstanding (earliest finish 2026-11-21 19:02:22 UTC).
 - R2: Client survives resolver connection churn without query loss.
   - Source: plan P0 "стабильность клиента".
   - Acceptance: TCP DNS adapter reconnects off the query path, re-sends queries from a closed connection,
@@ -131,8 +132,8 @@ satisfied.
 
 ## Current Checkpoint
 - Closes: R1 (locally reproduced production abort and candidate fix).
-- Next: request explicit approval before replacing the shared n-de1 binary or restarting Slipstream.
-  Keep default MTU 900 for deployment; Yandex 900→1200 A/B is a subsequent approved experiment.
+- Next: observe seven crash-free days from 2026-11-14 19:02:22 UTC, then request drop-in removal/restart.
+  Deployment retained default MTU 900; Yandex 900→1200 A/B is a subsequent approved experiment.
 - R1: coredump capture active on n-de1 since 2026-11-14 14:35 CET (drop-in
   `/etc/systemd/system/slipstream.service.d/coredump.conf`, recorded in ops `docs/n-de1.md`).
   Fresh read-only check contradicts the handover's no-core report: SIGABRT at 18:03:01 CET,
@@ -157,14 +158,18 @@ satisfied.
   Rostelecom pair 224 1000/82; Yandex `.88`+Rostelecom 224 1211/89 (best, single window).
   Server CPU at ~1 MB/s: 13–26 % of one vCPU, no throttling.
 - R1 local evidence: ASan/UBSan stress 4×900 s, 4.6 M queries, no abort.
-- Blocker: R1 live acceptance requires separately authorized deployment and seven-day observation.
+- Blocker: R1 live acceptance requires the seven-day observation interval; Android TCP/UDP post-deploy
+  acceptance has not been rerun in this checkpoint.
 - Debian 12 x86_64 release artifact (outside Git):
   `/home/stfu/.cache/opencode-tmp/opencode/ss-resume-debian/build/slipstream-server`, SHA-256
   `75c35137cea0d2902a7307d448a4f40dc83461f23ae49bd76812e5d724e50c50`.
   Built in `debian:bookworm-slim` with static project libraries; system OpenSSL/glibc remain dynamic.
   Local smoke: survived the production-aborting header, answered the next DNS query;
   `--mtu 1200` starts, 599/1401 rejected. Default remains 900; no resolver MTU A/B run yet.
-- Next: deployment approval, then seven-day observation and separately approved Yandex MTU A/B.
+- Deployed artifact hash matches the candidate; Slipstream active, NRestarts=0 after one approved restart.
+  Both authoritative suffixes answer DNS; FlowRelay/WARP PID/counters and unit/drop-in hashes unchanged.
+  Exact backup/rollback anchor is recorded in the authoritative ops `docs/n-de1.md`.
+- Next: seven-day observation and separately approved Yandex MTU A/B.
 
 ## Material Decisions
 - 2026-11-14: resolver scope limited to Yandex, Rostelecom, LTE operator DNS (user).
@@ -189,6 +194,9 @@ satisfied.
   Debian 12 release built and passed local crash-regression/CLI smoke. Independent agent review failed
   to run; direct review checked CLI consumers, slot initialization and picoquic packet-size boundary.
   No remote writes or restarts performed in this checkpoint.
+- 2026-11-14 deployment checkpoint: user explicitly approved binary replacement and Slipstream-only
+  restart. Deployed `eda3e1f` at 19:02:22 UTC with current-C rollback backup, default MTU 900.
+  Server-side DNS/listener checks passed; no Android TCP/UDP end-to-end or MTU A/B claim.
 
 ## Completion
 - Resolved outcomes:

@@ -41,7 +41,15 @@ satisfied.
     zero `status=6/ABRT` (or other crash) in `journalctl -u slipstream.service` for 7 days after deployment.
   - Primary evidence: local reproduction/regression test + 7-day journal check on n-de1.
   - Status: in_progress
-  - Evidence:
+  - Evidence: 2026-11-14 resume: downloaded production binary SHA-256
+    `b7c6b7ce4905adde4108b820115f1fce538d4afa79782fba6745203e5d2b3702` aborts locally
+    on loopback after a single 12-byte DNS header with QDCOUNT=1: exit SIGABRT,
+    `codec.c:194: block_okay: Assertion block.size > 0 failed`.
+    Local fix permits exhausted decode blocks, rejects malformed OPT lengths, and fixes unsigned
+    32-bit decoding shifts. This proves a production crash trigger, not attribution of all historical exits.
+    Fresh Clang ASan/UBSan Meson suite: 7/7 passed, including codec, 200,000 deterministic mutations
+    plus truncations, and runtime transport/multipath checks (56.65 s).
+    Deployment and the seven-day crash-free observation remain outstanding.
 - R2: Client survives resolver connection churn without query loss.
   - Source: plan P0 "стабильность клиента".
   - Acceptance: TCP DNS adapter reconnects off the query path, re-sends queries from a closed connection,
@@ -89,7 +97,13 @@ satisfied.
       moments, not at the phone failure time, so a WARP-wide outage is not the cause of that gap.
       Manual next-video starts at 144p: 2.8–4.4 s.
     - Gap > 10 s criterion is missed by 2.1–2.7 s; cause of 10 s probe timeouts, slow page loads under
-      480p load and transition buffering is not identified.
+      480p load and transition buffering was not identified in these sessions.
+    - Later ops evidence (`/home/stfu/ai/work-table/space/docs/n-de1.md`): WireGuard/rekey-period
+      delays of 1.5–1.8 s reproduced through WARP without the tunnel (3/277 vs direct 0/286).
+      MASQUE removed Cloudflare stalls but introduced 7–8 s TLS delays to non-Cloudflare destinations;
+      WireGuard was restored. Handover attributes the longer stalls to WARP, but this record does not
+      prove that every earlier phone gap or buffering episode had that cause. R5 acceptance remains open;
+      do not change the tunnel or WARP based solely on that attribution.
 
 ### Constraints
 - C1: Resolvers in scope: Yandex (`77.88.8.88`, `77.88.8.1`, other Yandex IPv4), Rostelecom
@@ -116,18 +130,22 @@ satisfied.
 - Budget: none stated.
 
 ## Current Checkpoint
-- Closes: R5 (diagnosis), R1 (wait for production abort).
-- R5 next: attribute the 10 s probe timeouts and slow page loads under 480p load — per-flow timing on
-  the phone (connect/TLS/TTFB split) vs native child stream state; check whether YouTube QUIC (UDP/443)
-  through UoT is involved by comparing transition buffering with UDP/443 blocked for the DNS profile.
+- Closes: R1 (locally reproduced production abort and candidate fix).
+- Next: request explicit approval before replacing the shared n-de1 binary or restarting Slipstream.
+  Keep default MTU 900 for deployment; Yandex 900→1200 A/B is a subsequent approved experiment.
 - R1: coredump capture active on n-de1 since 2026-11-14 14:35 CET (drop-in
   `/etc/systemd/system/slipstream.service.d/coredump.conf`, recorded in ops `docs/n-de1.md`).
-  Next abort leaves `/var/lib/slipstream/core` (0600, contains key material: analyse on host only,
+  Fresh read-only check contradicts the handover's no-core report: SIGABRT at 18:03:01 CET,
+  service restarted at 18:03:04, NRestarts=1; `/var/lib/slipstream/core` exists (3,084,288 bytes, 0600).
+  On-host stack inspection is blocked: `gdb: not found`. No package installed, core copied or deleted.
+  Any next abort leaves `/var/lib/slipstream/core` (0600, contains key material: analyse on host only,
   `gdb` against the unstripped production binary, then delete).
-- Stop or replan if: coredump shows a cause outside slipstream/picoquic code.
+- Remove the drop-in only after seven crash-free days after deployment, with restart approval.
+- R5: WARP mitigation belongs to operations; no WARP changes authorized by this source checkpoint.
 
 ## Current State
-- Resolved: R2, R3, R4. R5 in progress (see evidence). Phone left with VPN stopped.
+- Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Handover reports debug VPN running;
+  current phone state has not been rechecked.
 - Lab setup (reproducible): debug APK `org.owenewans.owenclave.debug` installs beside production
   (debug signing; profile `lab`, `tcp+mp://77.88.8.88:53`). Native ELF built in `rust:1.97.1-bookworm`
   with NDK 29.0.14206865 via `owenclave/bin/lib/slipstream/build.sh` (host lacks Perl FindBin);
@@ -139,8 +157,14 @@ satisfied.
   Rostelecom pair 224 1000/82; Yandex `.88`+Rostelecom 224 1211/89 (best, single window).
   Server CPU at ~1 MB/s: 13–26 % of one vCPU, no throttling.
 - R1 local evidence: ASan/UBSan stress 4×900 s, 4.6 M queries, no abort.
-- Blocker: none for R5 diagnosis; R1 waits for the next production abort (historical rate ~1 per 1–2 days).
-- Next: R5 diagnosis; then optional server MTU work (Yandex path only; 1232-byte egress limits others).
+- Blocker: R1 live acceptance requires separately authorized deployment and seven-day observation.
+- Debian 12 x86_64 release artifact (outside Git):
+  `/home/stfu/.cache/opencode-tmp/opencode/ss-resume-debian/build/slipstream-server`, SHA-256
+  `75c35137cea0d2902a7307d448a4f40dc83461f23ae49bd76812e5d724e50c50`.
+  Built in `debian:bookworm-slim` with static project libraries; system OpenSSL/glibc remain dynamic.
+  Local smoke: survived the production-aborting header, answered the next DNS query;
+  `--mtu 1200` starts, 599/1401 rejected. Default remains 900; no resolver MTU A/B run yet.
+- Next: deployment approval, then seven-day observation and separately approved Yandex MTU A/B.
 
 ## Material Decisions
 - 2026-11-14: resolver scope limited to Yandex, Rostelecom, LTE operator DNS (user).
@@ -158,6 +182,13 @@ satisfied.
 - 2026-11-14: R3/R4 verified — six APK/gVisor CT/TC pairs, DL ×3.27, UL ×2.06, loaded p95 1.62 → 0.69 s.
 - 2026-11-14: R5 two 30-min sessions — throughput/latency fine, 480p60 plays; strict >10 s gap criterion
   missed (12.1/12.7 s), slow page loads and transition buffering under 480p load remain unexplained.
+- 2026-11-14 resume: exact production binary reproduced header-only SIGABRT locally; candidate passed
+  `ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 meson test -C
+  /home/stfu/.cache/opencode-tmp/opencode/ss-resume-clang --print-errorlogs` (7/7).
+  Host GCC sanitizer setup failed because libasan/libubsan are absent; Clang build succeeded.
+  Debian 12 release built and passed local crash-regression/CLI smoke. Independent agent review failed
+  to run; direct review checked CLI consumers, slot initialization and picoquic packet-size boundary.
+  No remote writes or restarts performed in this checkpoint.
 
 ## Completion
 - Resolved outcomes:

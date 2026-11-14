@@ -180,18 +180,19 @@ typedef struct ddns_context
     return 1;
   }
   
+  /* An exhausted block (size == 0) is a normal state at the end of a packet or
+   * decode pool; callers check sizes before reading. Asserting size > 0 let a
+   * header-only query (QDCOUNT=1, 12 bytes) abort the authoritative server. */
   static int pblock_okay(block__s const *block)
   {
     assert(block       != NULL);
     assert(block->ptr  != NULL);
-    assert(block->size >  0);
     return 1;
   }
   
   static int block_okay(block__s const block)
   {
     assert(block.ptr  != NULL);
-    assert(block.size >  0);
     return 1;
   }
   
@@ -1155,10 +1156,10 @@ static inline uint32_t read_uint32(block__s *parse)
   assert(pblock_okay(parse));
   assert(parse->size >= 4);
   
-  val = (parse->ptr[0] << 24)
-      | (parse->ptr[1] << 16)
-      | (parse->ptr[2] <<  8)
-      | (parse->ptr[3]      );
+  val = ((uint32_t)parse->ptr[0] << 24)
+      | ((uint32_t)parse->ptr[1] << 16)
+      | ((uint32_t)parse->ptr[2] <<  8)
+      | ((uint32_t)parse->ptr[3]      );
   parse->ptr  += 4;
   parse->size -= 4;
   return val;
@@ -1919,12 +1920,17 @@ static inline dns_rcode_t decode_rr_opt(
     size_t   length;
     
     assert(dcontext_okay(data));
-    assert(len > 4);
+
+    /* Malformed OPT RDATA from the network is a format error, not an abort. */
+    if (len < 4 || len > data->parse.size)
+      return RCODE_FORMAT_ERROR;
     
     for (scan = data->parse.ptr , opt->numopts = 0 , length = len ; length > 0 ; )
     {
       size_t size;
       
+      if (length < 4)
+        return RCODE_FORMAT_ERROR;
       opt->numopts++;
       size    = ((scan[2] << 8) | (scan[3])) + 4;
       scan   += size;

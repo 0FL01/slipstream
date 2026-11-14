@@ -17,6 +17,7 @@ struct ServerArgs : MainArguments<ServerArgs> {
     std::vector<std::string> domain = option("domain", 'd', "Authoritative suffix (repeatable, required)");
     int max_connections = option("max-connections", '\0', "Maximum transport connections (1..32)") = 32;
     int idle_timeout = option("idle-timeout-seconds", '\0', "Transport idle timeout seconds") = 30;
+    int mtu = option("mtu", '\0', "Maximum QUIC packet size (600..1400); replies are capped per query by EDNS size") = 900;
 
     static std::string help(const std::string& program_name) {
         return "slipstream-server - A high-performance covert channel over DNS (server)\n\n" 
@@ -51,7 +52,7 @@ int main(int argc, char** argv) {
         exit(1);
     }
     if (args.max_connections < 1 || args.max_connections > 32 || args.idle_timeout < 1 ||
-        args.listen_port < 1 || args.listen_port > 65535) return 2;
+        args.listen_port < 1 || args.listen_port > 65535 || args.mtu < 600 || args.mtu > 1400) return 2;
     std::vector<const char*> domains;
     for (const auto& domain : args.domain) {
         if (domain.empty() || domain.size() > 180) return 2;
@@ -87,7 +88,8 @@ int main(int argc, char** argv) {
         &target_address,
         domains.data(), domains.size(), args.max_connections, args.idle_timeout,
         args.listen_host.empty() ? nullptr : args.listen_host.c_str(),
-        args.reset_seed.empty() ? nullptr : args.reset_seed.c_str()
+        args.reset_seed.empty() ? nullptr : args.reset_seed.c_str(),
+        (size_t)args.mtu
     );
 
 #ifdef _WINDOWS

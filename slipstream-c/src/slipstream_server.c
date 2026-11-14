@@ -43,6 +43,21 @@ ssize_t server_encode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
     return (ssize_t)size;
 }
 
+/* Largest QUIC payload whose TXT reply fits the requester's EDNS size (512 without
+ * EDNS) and the encoder buffer: header, echoed question, compressed answer RR, OPT RR
+ * and one length byte per 255-byte TXT string. */
+size_t server_quic_cap(const dns_query_t *q, size_t name_len) {
+    size_t limit = 512;
+    for (size_t i = 0; i < q->arcount; i++)
+        if (q->additional[i].generic.type == RR_OPT) limit = q->additional[i].opt.udp_payload;
+    if (limit < 512) limit = 512;
+    if (limit > MAX_UDP_PACKET_SIZE - 12) limit = MAX_UDP_PACKET_SIZE - 12; /* SPCDNS encoder slack */
+    size_t overhead = 12 + (name_len + 2 + 4) + (2 + 2 + 2 + 4 + 2) + 11 + 8; /* 8: encoder margin */
+    if (limit <= overhead + 2) return 1;
+    size_t avail = limit - overhead;
+    return avail - (avail + 255) / 256;
+}
+
 ssize_t server_decode(void *slot_ptr, void *ctx, unsigned char **dest, const unsigned char *src,
     size_t length, struct sockaddr_storage *peer, struct sockaddr_storage *local) {
     (void)ctx;
@@ -59,6 +74,7 @@ ssize_t server_decode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
     const char *name = q->questions[0].name;
     size_t n = strlen(name);
     if (n && name[n-1] == '.') n--;
+    slot->max_quic = server_quic_cap(q, n);
     size_t data_len = 0;
     for (size_t i = 0; i < server_domain_count; i++) {
         size_t d = strlen(server_domains[i]);

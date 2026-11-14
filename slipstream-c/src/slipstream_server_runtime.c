@@ -105,8 +105,8 @@ static int load_reset_seed(const char *path, uint8_t seed[16]) {
 
 int picoquic_slipstream_server(int port, bool ipv6, const char *cert, const char *key,
     struct sockaddr_storage *target, const char *const *domains, size_t domain_count,
-    size_t max_connections, size_t idle_timeout, const char *listen_host, const char *reset_seed_file) {
-    if (!domain_count || max_connections == 0 || max_connections > 32 || !idle_timeout) return 2;
+    size_t max_connections, size_t idle_timeout, const char *listen_host, const char *reset_seed_file, size_t mtu) {
+    if (!domain_count || max_connections == 0 || max_connections > 32 || !idle_timeout || mtu < 600 || mtu > 1400) return 2;
     struct sockaddr_in listen_address = {0};
     if (listen_host) {
         if (ipv6 || inet_pton(AF_INET, listen_host, &listen_address.sin_addr) != 1) return 2;
@@ -124,7 +124,7 @@ int picoquic_slipstream_server(int port, bool ipv6, const char *cert, const char
     config.nb_connections = (uint32_t)max_connections;
     config.server_cert_file = cert; config.server_key_file = key;
     config.server_port = port;
-    config.mtu_max = config.initial_send_mtu_ipv4 = config.initial_send_mtu_ipv6 = 900;
+    config.mtu_max = config.initial_send_mtu_ipv4 = config.initial_send_mtu_ipv6 = (uint32_t)mtu;
     config.multipath_option = 1; config.do_preemptive_repeat = 1;
     config.disable_port_blocking = 1; config.enable_sslkeylog = 0; config.alpn = SLIPSTREAM_ALPN;
     picoquic_quic_t *quic = picoquic_create_and_configure(&config, server_callback, &loop.head,

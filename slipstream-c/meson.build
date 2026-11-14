@@ -164,6 +164,13 @@ server_codec_test = executable('test-server-codec',
   dependencies: slipstream_cli_deps, include_directories: include_dirs,
   c_args: ['-UNDEBUG'])
 test('server-codec', server_codec_test)
+server_fuzz_test = executable('test-server-fuzz',
+  files('tests/test_server_fuzz.c', src / 'slipstream_utils.c',
+    src / 'slipstream_inline_dots.c', lua_resty / 'base32.c',
+    spcdns / 'codec.c', spcdns / 'mappings.c', spcdns / 'netsimple.c', spcdns / 'output.c'),
+  dependencies: slipstream_cli_deps, include_directories: include_dirs,
+  c_args: ['-UNDEBUG'])
+test('server-fuzz', server_fuzz_test, timeout: 120)
 # Explicit synthetic-only target: aggregate diagnostics never enter server_exe.
 feedback_wrap_args = ['-Wl,--wrap=picoquic_is_sending_authorized_by_pacing',
   '-Wl,--wrap=picoquic_prepare_packet_ex', '-Wl,--wrap=picoquic_open_flow_control']

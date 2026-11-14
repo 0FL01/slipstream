@@ -105,6 +105,31 @@ satisfied.
       WireGuard was restored. Handover attributes the longer stalls to WARP, but this record does not
       prove that every earlier phone gap or buffering episode had that cause. R5 acceptance remains open;
       do not change the tunnel or WARP based solely on that attribution.
+    - User-reported browsing failure reproduced over ADB after deployment. Initially debug VPN was
+      active and both DNS lookup and literal-IP HTTPS timed out. Force-stopping both app variants and
+      starting a fresh session restored access; the original stuck-session cause is not established.
+      Installed the signed native-bridge release over production (same signer, versionCode 1859),
+      stopped debug VPN, and verified `warp=on`. Brave rendered Wikipedia successfully.
+    - Sustained signed-release phone check: 48 requests (12 rounds × Cloudflare/Google/Wikipedia/Yandex),
+      12 connection/handshake timeouts at 8 s; all 12 Cloudflare requests passed. Other successful
+      requests sometimes needed 3–6 s. Local aggregate evidence:
+      `/home/stfu/.cache/opencode-tmp/opencode/owenclave-sites-20261114.jsonl`.
+      The same Google destination IP also timed out without the phone/tunnel: host direct 3/3 passed,
+      WARP SOCKS 2/3 timed out in one paired window. Six later paired native-netns/WARP-SOCKS checks
+      each had one 6 s TLS timeout; another SOCKS success took 5.08 s. Native netns requests explicitly
+      bound to CloudflareWARP. This proves a reachable egress failure independent of the DNS carrier,
+      but not its exact WARP root cause or attribution of the initial fully stuck session.
+    - User approved one WARP disconnect/connect, then explicitly replaced the egress requirement:
+      permanently use n-de1 DIRECT, without WARP. Reconnect did not fix TLS failures; the existing
+      phone session became fully stuck (28/28 subsequent probes failed) despite WARP recovery.
+    - DIRECT cutover at 2026-11-14 19:38:59 UTC: current FlowRelay built from existing source (Go tests
+      passed), host-loopback listener, eth0-bound destination/resolver sockets, deny-private enabled;
+      Slipstream target changed to loopback and both units detached from WARP lifecycle. Jazz unchanged.
+      After one manual phone VPN restart: exact same 48 website probes passed 48/48, p50/p95/max
+      0.693/1.287/2.187 s. Phone public IP matches n-de1, warp=off; TCP DL4MiB 6.38 s, acknowledged
+      UL512KiB 8.67 s, UDP DNS 3/3 transaction-checked. Wrong token/private destination rejected on backend.
+      Evidence: `/home/stfu/.cache/opencode-tmp/opencode/owenclave-sites-direct-20261114.jsonl`.
+      Automatic recovery of the old stuck session remains unresolved; no fresh 30-minute video acceptance.
 
 ### Constraints
 - C1: Resolvers in scope: Yandex (`77.88.8.88`, `77.88.8.1`, other Yandex IPv4), Rostelecom
@@ -116,6 +141,8 @@ satisfied.
 - C4: Load on third-party resolvers stays at production-like levels (≤ the tunnel's own lane budget,
   short foreground windows). No stress sweeps.
 - C5: No tokens, payload or QNAME captures, configs or generated binaries in Git.
+- C6: Latest user decision: DNS Tunnel/FlowRelay egress is permanently n-de1 DIRECT, not WARP;
+  no alternate egress fallback. Jazz/WARP remains separate. Preserve token auth and private-destination guard.
 
 ### Non-goals
 - Providers outside C1; UDP transport to resolvers; MasterDNS, Base36, BBR3 (already rejected).
@@ -142,7 +169,9 @@ satisfied.
   Any next abort leaves `/var/lib/slipstream/core` (0600, contains key material: analyse on host only,
   `gdb` against the unstripped production binary, then delete).
 - Remove the drop-in only after seven crash-free days after deployment, with restart approval.
-- R5: WARP mitigation belongs to operations; no WARP changes authorized by this source checkpoint.
+- R5: permanent DIRECT cutover passed bounded phone website/TCP/UDP acceptance. Remaining:
+  reproduce/fix automatic recovery of a stuck client and repeat the frozen 30-minute video session.
+  No further WARP changes needed for this path; do not change MTU/resolver choice to mask unrelated failures.
 
 ## Current State
 - Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Handover reports debug VPN running;
@@ -158,8 +187,8 @@ satisfied.
   Rostelecom pair 224 1000/82; Yandex `.88`+Rostelecom 224 1211/89 (best, single window).
   Server CPU at ~1 MB/s: 13–26 % of one vCPU, no throttling.
 - R1 local evidence: ASan/UBSan stress 4×900 s, 4.6 M queries, no abort.
-- Blocker: R1 live acceptance requires the seven-day observation interval; Android TCP/UDP post-deploy
-  acceptance has not been rerun in this checkpoint.
+- Blocker: R1 live acceptance requires the seven-day observation interval. Android TCP/UDP post-cutover
+  acceptance now passes on DIRECT; R5 remains incomplete as above.
 - Debian 12 x86_64 release artifact (outside Git):
   `/home/stfu/.cache/opencode-tmp/opencode/ss-resume-debian/build/slipstream-server`, SHA-256
   `75c35137cea0d2902a7307d448a4f40dc83461f23ae49bd76812e5d724e50c50`.
@@ -197,6 +226,10 @@ satisfied.
 - 2026-11-14 deployment checkpoint: user explicitly approved binary replacement and Slipstream-only
   restart. Deployed `eda3e1f` at 19:02:22 UTC with current-C rollback backup, default MTU 900.
   Server-side DNS/listener checks passed; no Android TCP/UDP end-to-end or MTU A/B claim.
+- 2026-11-14 DIRECT checkpoint: user explicitly approved permanent DNS egress change after the WARP
+  reconnect failed to fix independent TLS stalls. Ops authority updated after 48/48 phone probes,
+  TCP/UDP and private/auth guards passed; signed release installed, debug VPN stopped.
+  Current phone left on production VPN/DIRECT. No new APK source change in this checkpoint.
 
 ## Completion
 - Resolved outcomes:

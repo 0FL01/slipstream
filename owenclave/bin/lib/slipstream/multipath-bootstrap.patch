@@ -1,0 +1,57 @@
+diff --git a/crates/slipstream-client/src/runtime.rs b/crates/slipstream-client/src/runtime.rs
+--- a/crates/slipstream-client/src/runtime.rs
++++ b/crates/slipstream-client/src/runtime.rs
+@@ -281,13 +281,20 @@
+     let mut reconnect_delay = Duration::from_millis(RECONNECT_SLEEP_MIN_MS);
++    let mut bootstrap_attempt = 0usize;
+ 
+     loop {
+-        let mut resolvers = resolve_resolvers(config.resolvers, mtu, config.debug_poll)?;
+-        if resolvers.is_empty() {
++        let mut specs = config.resolvers.to_vec();
++        if specs.is_empty() {
+             return Err(ClientError::new("At least one resolver is required"));
+         }
++        if bootstrap_attempt >= specs.len() {
++            return Err(ClientError::new("All DNS bootstrap paths timed out"));
++        }
++        specs.rotate_left(bootstrap_attempt);
++        let mut resolvers = resolve_resolvers(&specs, mtu, config.debug_poll)?;
+ 
+         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
+ 
+         let current_time = unsafe { picoquic_current_time() };
++        let current_time_started = current_time;
+         let quic = unsafe {
+             picoquic_create(
+@@ -386,8 +393,21 @@
+             let closing = unsafe { (*state_ptr).is_closing() };
+             if closing {
++                if resolvers.len() > 1 && !unsafe { (*state_ptr).is_ready() } {
++                    bootstrap_attempt += 1;
++                }
+                 break;
+             }
+ 
+             let ready = unsafe { (*state_ptr).is_ready() };
++            // A secondary QUIC path cannot be added until the handshake completes.
++            // Bound each initial attempt, then recreate only the connection, not the child.
++            if !ready
++                && resolvers.len() > 1
++                && current_time.saturating_sub(current_time_started) >= 3_000_000
++            {
++                bootstrap_attempt += 1;
++                break;
++            }
+             if ready {
++                bootstrap_attempt = 0;
+                 unsafe {
+@@ -789,6 +810,8 @@
+         unsafe {
+             picoquic_close(cnx, 0);
+         }
++        // Destruction can invoke callbacks; clear their state only afterwards.
++        drop(_quic_guard);
+ 
+         unsafe {
+             (*state_ptr).reset_for_reconnect();

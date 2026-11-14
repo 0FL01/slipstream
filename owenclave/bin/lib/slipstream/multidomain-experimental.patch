@@ -1,0 +1,279 @@
+--- a/crates/slipstream-client/src/dns/poll.rs
++++ b/crates/slipstream-client/src/dns/poll.rs
+@@ -34,7 +34,7 @@ pub(crate) fn expire_inflight_polls(inflight_poll_ids: &mut HashMap<u16, u64>, n
+ pub(crate) async fn send_poll_queries(
+     cnx: *mut picoquic_cnx_t,
+     udp: &TokioUdpSocket,
+-    config: &ClientConfig<'_>,
++    _config: &ClientConfig<'_>,
+     local_addr_storage: &mut libc::sockaddr_storage,
+     dns_id: &mut u16,
+     resolver: &mut ResolverState,
+@@ -87,7 +87,13 @@ pub(crate) async fn send_poll_queries(
+         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
+
+         let poll_id = *dns_id;
+-        let qname = build_qname(&send_buf[..send_length], config.domain)
++        let dest = normalize_dual_stack_addr(sockaddr_storage_to_socket_addr(&addr_to)?);
++        if dest != resolver.addr {
++            return Err(ClientError::new(
++                "Prepared poll does not match its resolver path",
++            ));
++        }
++        let qname = build_qname(&send_buf[..send_length], &resolver.domain)
+             .map_err(|err| ClientError::new(err.to_string()))?;
+         let params = QueryParams {
+             id: poll_id,
+--- a/crates/slipstream-client/src/dns/resolver.rs
++++ b/crates/slipstream-client/src/dns/resolver.rs
+@@ -10,6 +10,7 @@ use super::debug::DebugMetrics;
+
+ pub(crate) struct ResolverState {
+     pub(crate) addr: SocketAddr,
++    pub(crate) domain: String,
+     pub(crate) storage: libc::sockaddr_storage,
+     pub(crate) local_addr_storage: Option<libc::sockaddr_storage>,
+     pub(crate) mode: ResolverMode,
+@@ -55,6 +56,7 @@ pub(crate) fn resolve_resolvers(
+         let is_primary = idx == 0;
+         resolved.push(ResolverState {
+             addr,
++            domain: String::new(),
+             storage: socket_addr_to_storage(addr),
+             local_addr_storage: None,
+             mode: resolver.mode,
+--- a/crates/slipstream-client/src/main.rs
++++ b/crates/slipstream-client/src/main.rs
+@@ -52,6 +52,8 @@
+     gso: bool,
+     #[arg(long = "domain", short = 'd', value_parser = parse_domain)]
+     domain: Option<String>,
++    #[arg(long = "path-domain", value_parser = parse_path_domain)]
++    path_domain: Vec<(HostPort, String)>,
+     #[arg(long = "cert", value_name = "PATH")]
+     cert: Option<String>,
+     #[arg(long = "keep-alive-interval", short = 't', default_value_t = 400)]
+@@ -153,6 +155,11 @@
+         }
+     };
+
++    validate_path_domains(&args.path_domain, &resolvers).unwrap_or_else(|err| {
++        tracing::error!("Path domain error: {}", err);
++        std::process::exit(2);
++    });
++
+     let congestion_control = if args.congestion_control.is_some() {
+         args.congestion_control.clone()
+     } else {
+@@ -206,6 +213,7 @@
+         congestion_control: congestion_control.as_deref(),
+         gso: args.gso,
+         domain: &domain,
++        path_domains: &args.path_domain,
+         cert: cert.as_deref(),
+         keep_alive_interval: keep_alive_interval as usize,
+         idle_keep_alive_interval: args.idle_keep_alive_interval as usize,
+@@ -244,6 +252,109 @@
+     parse_host_port(input, 53, AddressKind::Resolver).map_err(|err| err.to_string())
+ }
+
++fn parse_path_domain(input: &str) -> Result<(HostPort, String), String> {
++    let (endpoint, domain) = input.split_once('=').ok_or("Expected endpoint=domain")?;
++    let domain = parse_domain(domain)?.to_ascii_lowercase();
++    if domain.len() >= 240
++        || domain.split('.').any(|label| {
++            label.is_empty()
++                || label.len() > 63
++                || label.starts_with('-')
++                || label.ends_with('-')
++                || !label
++                    .bytes()
++                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
++        })
++    {
++        return Err("Invalid DNS path suffix".into());
++    }
++    Ok((parse_resolver(endpoint)?, domain))
++}
++
++fn validate_path_domains(
++    paths: &[(HostPort, String)],
++    resolvers: &[ResolverSpec],
++) -> Result<(), String> {
++    if paths.is_empty() {
++        return Ok(());
++    }
++    if paths.len() != resolvers.len() {
++        return Err("Map every resolver exactly once".into());
++    }
++    for spec in resolvers {
++        if paths
++            .iter()
++            .filter(|(p, _)| p.host == spec.resolver.host && p.port == spec.resolver.port)
++            .count()
++            != 1
++        {
++            return Err("Map every resolver exactly once".into());
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod domain_mapping_tests {
++    use super::*;
++
++    #[test]
++    fn explicit_mapping_is_total_and_unambiguous() {
++        let paths = vec![
++            parse_path_domain("127.0.0.1:5301=T.X.ass-peak.de.").unwrap(),
++            parse_path_domain("127.0.0.1:5302=tt.x.ass-peak.de").unwrap(),
++        ];
++        let specs: Vec<_> = paths
++            .iter()
++            .map(|(resolver, _)| ResolverSpec {
++                resolver: resolver.clone(),
++                mode: ResolverMode::Authoritative,
++            })
++            .collect();
++        assert_eq!(paths[0].1, "t.x.ass-peak.de");
++        assert!(validate_path_domains(&paths, &specs).is_ok());
++        assert!(validate_path_domains(&[], &specs).is_ok());
++        assert!(validate_path_domains(&paths[..1], &specs).is_err());
++        assert!(validate_path_domains(&[paths[0].clone(), paths[0].clone()], &specs).is_err());
++        let mut reverse = paths.clone();
++        reverse.reverse();
++        assert!(validate_path_domains(&reverse, &specs).is_ok());
++        for value in [
++            "",
++            "127.0.0.1:53",
++            "=test.com",
++            "127.0.0.1:53=",
++            "127.0.0.1:53=a..com",
++            "127.0.0.1:53=a.com=b.com",
++        ] {
++            assert!(parse_path_domain(value).is_err(), "{value}");
++        }
++    }
++
++    #[test]
++    fn shared_mtu_fits_both_suffixes() {
++        use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
++        for domain in ["t.x.ass-peak.de", "tt.x.ass-peak.de"] {
++            for length in 1..=140 {
++                let qname = build_qname(&vec![0xff; length], domain).unwrap();
++                assert!(qname.trim_end_matches('.').len() <= 253);
++                let packet = encode_query(&QueryParams {
++                    id: 1,
++                    qname: &qname,
++                    qtype: RR_TXT,
++                    qclass: CLASS_IN,
++                    rd: true,
++                    cd: false,
++                    qdcount: 1,
++                    is_query: true,
++                })
++                .unwrap();
++                assert!(packet.len() <= 512);
++            }
++        }
++    }
++}
++
+ fn build_resolvers(matches: &clap::ArgMatches, require: bool) -> Result<Vec<ResolverSpec>, String> {
+     let mut ordered = Vec::new();
+     collect_resolvers(matches, "resolver", ResolverMode::Recursive, &mut ordered)?;
+--- a/crates/slipstream-client/src/runtime.rs
++++ b/crates/slipstream-client/src/runtime.rs
+@@ -219,7 +219,13 @@
+     config: &ClientConfig<'_>,
+     flow_relay: Option<Arc<FlowRelayConfig>>,
+ ) -> Result<i32, ClientError> {
+-    let domain_len = config.domain.len();
++    // One QUIC context can schedule on any path; cap it for the longest suffix.
++    let domain_len = config
++        .path_domains
++        .iter()
++        .map(|(_, d)| d.len())
++        .max()
++        .unwrap_or(config.domain.len());
+     let mtu = compute_mtu(domain_len)?;
+     let udp = bind_udp_socket().await?;
+
+@@ -291,6 +297,16 @@
+         }
+         specs.rotate_left(bootstrap_attempt);
+         let mut resolvers = resolve_resolvers(&specs, mtu, config.debug_poll)?;
++        for (resolver, spec) in resolvers.iter_mut().zip(&specs) {
++            resolver.domain = config
++                .path_domains
++                .iter()
++                .find(|(p, _)| p.host == spec.resolver.host && p.port == spec.resolver.port)
++                .map(|(_, d)| d.as_str())
++                .unwrap_or(config.domain)
++                .to_owned();
++        }
++        let mut domain_report_at = 0;
+
+         let mut local_addr_storage = socket_addr_to_storage(udp.local_addr().map_err(map_io)?);
+
+@@ -598,17 +614,17 @@
+                 if addr_to.ss_family == 0 {
+                     break;
+                 }
+-                if let Ok(dest) = sockaddr_storage_to_socket_addr(&addr_to) {
+-                    let dest = normalize_dual_stack_addr(dest);
+-                    if let Some(resolver) = find_resolver_by_addr_mut(&mut resolvers, dest) {
+-                        resolver.local_addr_storage = Some(unsafe { std::ptr::read(&addr_from) });
+-                        resolver.debug.send_packets = resolver.debug.send_packets.saturating_add(1);
+-                        resolver.debug.send_bytes =
+-                            resolver.debug.send_bytes.saturating_add(send_length as u64);
+-                    }
+-                }
++                let dest = normalize_dual_stack_addr(sockaddr_storage_to_socket_addr(&addr_to)?);
++                let resolver =
++                    find_resolver_by_addr_mut(&mut resolvers, dest).ok_or_else(|| {
++                        ClientError::new("Outbound path is not a configured resolver")
++                    })?;
++                resolver.local_addr_storage = Some(unsafe { std::ptr::read(&addr_from) });
++                resolver.debug.send_packets = resolver.debug.send_packets.saturating_add(1);
++                resolver.debug.send_bytes =
++                    resolver.debug.send_bytes.saturating_add(send_length as u64);
+
+-                let qname = build_qname(&send_buf[..send_length], config.domain)
++                let qname = build_qname(&send_buf[..send_length], &resolver.domain)
+                     .map_err(|err| ClientError::new(err.to_string()))?;
+                 let params = QueryParams {
+                     id: dns_id,
+@@ -771,6 +787,21 @@
+             }
+
+             let report_time = unsafe { picoquic_current_time() };
++            if !config.path_domains.is_empty() && report_time >= domain_report_at {
++                for resolver in &resolvers {
++                    info!(
++                        "domain_usage suffix={} endpoint={} data={} polls={}",
++                        resolver.domain,
++                        resolver.addr,
++                        resolver
++                            .debug
++                            .send_packets
++                            .saturating_sub(resolver.debug.polls_sent),
++                        resolver.debug.polls_sent
++                    );
++                }
++                domain_report_at = report_time.saturating_add(5_000_000);
++            }
+             let (enqueued_bytes, last_enqueue_at) = unsafe { (*state_ptr).debug_snapshot() };
+             let streams_len = unsafe { (*state_ptr).streams_len() };
+             for resolver in resolvers.iter_mut() {
+--- a/crates/slipstream-ffi/src/lib.rs
++++ b/crates/slipstream-ffi/src/lib.rs
+@@ -28,6 +28,7 @@
+     pub tcp_listen_port: u16,
+     pub resolvers: &'a [ResolverSpec],
+     pub domain: &'a str,
++    pub path_domains: &'a [(HostPort, String)],
+     pub cert: Option<&'a str>,
+     pub congestion_control: Option<&'a str>,
+     pub gso: bool,

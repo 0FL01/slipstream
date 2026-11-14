@@ -1,0 +1,31 @@
+diff --git a/picoquic/sender.c b/picoquic/sender.c
+--- a/picoquic/sender.c
++++ b/picoquic/sender.c
+@@ -4405,6 +4405,13 @@
+     if (ret == 0) {
+         int path_id;
++        uint64_t requested_unique_id = 0;
++        if (path_id_request != -1) {
++            if (path_id_request < 0 || path_id_request >= cnx->nb_paths) {
++                return 0;
++            }
++            requested_unique_id = cnx->path[path_id_request]->unique_path_id;
++        }
+ 
+         /* Remove delete paths */
+         if (cnx->path_demotion_needed) {
+             picoquic_delete_abandoned_paths(cnx, current_time, &next_wake_time);
+@@ -4415,7 +4422,12 @@
+         if (path_id_request != -1) {
+-            path_id = path_id_request;
++            path_id = picoquic_get_path_id_from_unique(cnx, requested_unique_id);
++            /* A queued DNS reply may refer to a retired or not-yet-keyed path. */
++            if (path_id < 0 || cnx->path[path_id]->p_remote_cnxid == NULL) {
++                return 0;
++            }
++            picoquic_set_path_addresses(cnx, path_id, 0, p_addr_to, p_addr_from, if_index);
+         }
+ 
+         /* Send the available packets */
+         if (send_msg_size != NULL) {
+             *send_msg_size = cnx->path[path_id]->send_mtu;

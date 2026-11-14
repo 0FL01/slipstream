@@ -1,0 +1,25 @@
+diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
+--- a/picoquic/picoquic_internal.h
++++ b/picoquic/picoquic_internal.h
+@@ -831,4 +831,5 @@
+     uint8_t stream_priority;
+     /* Flags describing the state of the stream */
++    unsigned int app_flow_control : 1; /* Application grants receive credit after socket writes. */
+     unsigned int is_active : 1; /* The application is actively managing data sending through callbacks */
+     unsigned int fin_requested : 1; /* Application has requested Fin of sending stream */
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -1279,5 +1279,5 @@
+         if (!is_deleted) {
+             if (!stream->fin_signalled) {
+-                if (!stream->fin_received && !stream->reset_received && 2 * stream->consumed_offset > stream->maxdata_local) {
++                if (!stream->app_flow_control && !stream->fin_received && !stream->reset_received && 2 * stream->consumed_offset > stream->maxdata_local) {
+                     cnx->max_stream_data_needed = 1;
+                 }
+@@ -4334,4 +4334,4 @@
+             uint64_t new_window = picoquic_cc_increased_window(cnx, stream->maxdata_local);
+
+-            if (!stream->reset_received && 2 * stream->consumed_offset > stream->maxdata_local) {
++            if (!stream->app_flow_control && !stream->reset_received && 2 * stream->consumed_offset > stream->maxdata_local) {
+                 bytes0 = bytes;

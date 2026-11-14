@@ -1,0 +1,10 @@
+__pycache__/
+*.jsonl
+*.json
+*.pem
+*.so
+.token
+.credentials.json
+.warp.credentials.json
+final-screen-report.md
+resumed-report.md

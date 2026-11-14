@@ -1,0 +1,89 @@
+{
+  "repositories": [
+    {
+      "path": "owenclave",
+      "commit": "9c8c8799fef8e42c2239ca0bd54fb03afadd737f",
+      "origin": "git@github.com:0FL01/owenclave.git",
+      "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "slipstream-c",
+      "commit": "16fdfe97159a3b0b7b13563a671a730923e68c55",
+      "origin": "git@github.com:0FL01/slipstream.git",
+      "diff_sha256": "0b3a2e1d3973c7d7880fd8e8c51e11a02b4f32000721596cd7b5296dfa6275f4"
+    },
+    {
+      "path": "slipstream-c/extern/SPCDNS",
+      "commit": "d291537e1f66b4a7ede069b949a8db0f94c59246",
+      "origin": "https://github.com/spc476/SPCDNS.git",
+      "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "slipstream-c/extern/lua-resty-base-encoding",
+      "commit": "bd9246f681806b26469e0d874c893dcab4975aeb",
+      "origin": "https://github.com/EndPositive/lua-resty-base-encoding.git",
+      "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "slipstream-c/extern/quick_arg_parser",
+      "commit": "153b0accc1f0201df9d2fd169bafaeee53e6f300",
+      "origin": "https://github.com/Dugy/quick_arg_parser.git",
+      "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "slipstream-c/subprojects/picoquic",
+      "commit": "2ee2ecd189354791e15cc1ff9db86e4e4b8eba10",
+      "origin": "https://github.com/EndPositive/slipstream-picoquic",
+      "diff_sha256": "4fe08d92519722ea55aa50a59e0facb87202a30fe652e1884d31a3c951f481bc"
+    },
+    {
+      "path": "slipstream-rust",
+      "commit": "bc772dd07d9a136dbd7553b0da575526de207847",
+      "origin": "https://github.com/Mygod/slipstream-rust.git",
+      "diff_sha256": "beed0e29645eca3bb47ba4ed2379a8d71600c9fc23eb3f90edb9394c2ece4b57"
+    },
+    {
+      "path": "slipstream-rust/vendor/picoquic",
+      "commit": "4bd356c004a50ec46ee8a933ebd024da5d659f75",
+      "origin": "https://github.com/Mygod/slipstream-picoquic",
+      "diff_sha256": "098b7a19de29db01de148a5535798c2fda9ec49fdb3885290a3fc7631a2bf799"
+    }
+  ],
+  "omitted": [
+    "owenclave/.direnv/bin/nix-direnv-reload",
+    "owenclave/.direnv/flake-inputs/7j1q60m17gf95k3s0gk2qvjqygnp1q36-source",
+    "owenclave/.direnv/flake-inputs/7y7alzzd0d1prp5yri2cq91n5jidszi7-source",
+    "owenclave/.direnv/flake-profile-a5d5b61aa8a61b7d9d765e1daf971a9a578f1cfa",
+    "owenclave/.direnv/flake-profile-a5d5b61aa8a61b7d9d765e1daf971a9a578f1cfa.rc",
+    "owenclave/release.keystore",
+    "slipstream-c/.gitmodules",
+    "slipstream-c/certs/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/ecdsa/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/ed25519/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/esni-secp256r1.key",
+    "slipstream-c/subprojects/picoquic/certs/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/rsa-pkcs8/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/rsa-pkcs8/keypair.pem",
+    "slipstream-c/subprojects/picoquic/certs/rsa/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/secp256r1-pkcs8/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/secp256r1/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/secp384r1/key.pem",
+    "slipstream-c/subprojects/picoquic/certs/secp521r1/key.pem",
+    "slipstream-c/subprojects/picoquic/valgrind_out.txt",
+    "slipstream-rust/.gitmodules",
+    "slipstream-rust/fixtures/certs/alt_key.pem",
+    "slipstream-rust/fixtures/certs/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/ecdsa/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/ed25519/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/esni-secp256r1.key",
+    "slipstream-rust/vendor/picoquic/certs/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/rsa-pkcs8/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/rsa-pkcs8/keypair.pem",
+    "slipstream-rust/vendor/picoquic/certs/rsa/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/secp256r1-pkcs8/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/secp256r1/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/secp384r1/key.pem",
+    "slipstream-rust/vendor/picoquic/certs/secp521r1/key.pem",
+    "slipstream-rust/vendor/picoquic/valgrind_out.txt"
+  ]
+}

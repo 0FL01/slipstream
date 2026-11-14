@@ -1,0 +1,559 @@
+diff --git a/crates/slipstream-client/src/runtime.rs b/crates/slipstream-client/src/runtime.rs
+index c902d41..16991bc 100644
+--- a/crates/slipstream-client/src/runtime.rs
++++ b/crates/slipstream-client/src/runtime.rs
+@@ -48,21 +48,143 @@ const SLIPSTREAM_ALPN: &str = "picoquic_sample";
+ const SLIPSTREAM_SNI: &str = "test.example.com";
+ const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
+ const DNS_POLL_SLICE_US: u64 = 50_000;
++const BUSY_WINDOW_US: u64 = 400_000;
++const WARM_WINDOW_US: u64 = 1_000_000;
++const WARM_POLL_INTERVAL_US: u64 = 400_000;
++const QUIESCENT_POLL_INTERVAL_US: u64 = 2_000_000;
++
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++enum SchedulerPhase {
++    #[default]
++    Empty,
++    Busy,
++    Warm,
++    QuiescentOpen,
++}
++
++impl SchedulerPhase {
++    fn poll_interval_us(self) -> Option<u64> {
++        match self {
++            Self::Warm => Some(WARM_POLL_INTERVAL_US),
++            Self::QuiescentOpen => Some(QUIESCENT_POLL_INTERVAL_US),
++            _ => None,
++        }
++    }
++}
+ 
+-fn keep_alive_interval(streams: usize, active: usize, idle: usize) -> usize {
++fn scheduler_phase(
++    streams: usize,
++    last_activity_at: u64,
++    now: u64,
++    has_ready_stream: bool,
++    flow_blocked: bool,
++) -> SchedulerPhase {
+     if streams == 0 {
+-        idle
++        return SchedulerPhase::Empty;
++    }
++    if has_ready_stream || flow_blocked || now.saturating_sub(last_activity_at) < BUSY_WINDOW_US {
++        return SchedulerPhase::Busy;
++    }
++    if now.saturating_sub(last_activity_at) < WARM_WINDOW_US {
++        SchedulerPhase::Warm
+     } else {
++        SchedulerPhase::QuiescentOpen
++    }
++}
++
++fn keep_alive_interval(phase: SchedulerPhase, active: usize, idle: usize) -> usize {
++    if phase == SchedulerPhase::Busy {
+         active
++    } else {
++        idle
+     }
+ }
+ 
+-fn authoritative_polling_needed(
+-    streams: usize,
++fn authoritative_poll_budget(
++    phase: SchedulerPhase,
++    pacing_deficit: usize,
++    sparse_poll_due: bool,
+     has_ready_stream: bool,
+     flow_blocked: bool,
+-) -> bool {
+-    streams > 0 && !(has_ready_stream && !flow_blocked)
++) -> usize {
++    match phase {
++        SchedulerPhase::Empty => 0,
++        SchedulerPhase::Busy if has_ready_stream && !flow_blocked => 0,
++        SchedulerPhase::Busy => pacing_deficit,
++        SchedulerPhase::Warm | SchedulerPhase::QuiescentOpen => usize::from(sparse_poll_due),
++    }
++}
++
++#[derive(Default)]
++struct ActivityScheduler {
++    phase: SchedulerPhase,
++    next_sparse_poll_at: u64,
++}
++
++impl ActivityScheduler {
++    fn update(
++        &mut self,
++        streams: usize,
++        last_activity_at: u64,
++        now: u64,
++        has_ready_stream: bool,
++        flow_blocked: bool,
++    ) -> SchedulerPhase {
++        let next = scheduler_phase(
++            streams,
++            last_activity_at,
++            now,
++            has_ready_stream,
++            flow_blocked,
++        );
++        if next != self.phase {
++            if next == SchedulerPhase::Warm
++                || (next == SchedulerPhase::QuiescentOpen && self.phase != SchedulerPhase::Warm)
++            {
++                self.next_sparse_poll_at = now;
++            } else if next == SchedulerPhase::Empty {
++                self.next_sparse_poll_at = 0;
++            }
++            self.phase = next;
++        }
++        next
++    }
++
++    fn sparse_poll_due(&self, now: u64) -> bool {
++        self.phase.poll_interval_us().is_some() && now >= self.next_sparse_poll_at
++    }
++
++    fn record_sparse_poll(&mut self, now: u64, sent: bool) {
++        let Some(interval) = self.phase.poll_interval_us() else {
++            return;
++        };
++        self.next_sparse_poll_at =
++            now.saturating_add(if sent { interval } else { DNS_POLL_SLICE_US });
++    }
++
++    fn timeout_us(
++        &self,
++        quic_delay_us: u64,
++        now: u64,
++        last_activity_at: u64,
++        transport_fast_work: bool,
++    ) -> u64 {
++        if self.phase == SchedulerPhase::Busy || transport_fast_work {
++            return quic_delay_us.clamp(1, DNS_POLL_SLICE_US);
++        }
++        let app_deadline = match self.phase {
++            SchedulerPhase::Warm => Some(
++                self.next_sparse_poll_at
++                    .min(last_activity_at.saturating_add(WARM_WINDOW_US)),
++            ),
++            SchedulerPhase::QuiescentOpen => Some(self.next_sparse_poll_at),
++            _ => None,
++        };
++        app_deadline
++            .map(|deadline| quic_delay_us.min(deadline.saturating_sub(now).max(1)))
++            .unwrap_or(quic_delay_us)
++            .max(1)
++    }
+ }
+ 
+ unsafe fn set_keep_alive(cnx: *mut picoquic_cnx_t, interval: usize) {
+@@ -241,7 +363,8 @@ pub async fn run_client(
+             picoquic_enable_path_callbacks(cnx, 1);
+             set_keep_alive(cnx, config.idle_keep_alive_interval);
+         }
+-        let mut active_streams = false;
++        let mut scheduler = ActivityScheduler::default();
++        let mut current_keep_alive = config.idle_keep_alive_interval;
+ 
+         if config.gso {
+             warn!("GSO is not implemented in the Rust client loop yet.");
+@@ -292,30 +415,35 @@ pub async fn run_client(
+                 unsafe { picoquic_get_next_wake_delay(quic, current_time, DNS_WAKE_DELAY_MAX_US) };
+             let delay_us = if delay_us < 0 { 0 } else { delay_us as u64 };
+             let streams_len_for_sleep = unsafe { (*state_ptr).streams_len() };
+-            let has_active_streams = streams_len_for_sleep > 0;
+-            if has_active_streams != active_streams {
++            let last_activity_at = unsafe { (*state_ptr).last_activity_at() };
++            let has_ready_stream_for_sleep = unsafe { slipstream_has_ready_stream(cnx) != 0 };
++            let flow_blocked_for_sleep = unsafe { slipstream_is_flow_blocked(cnx) } != 0;
++            let phase = scheduler.update(
++                streams_len_for_sleep,
++                last_activity_at,
++                current_time,
++                has_ready_stream_for_sleep,
++                flow_blocked_for_sleep,
++            );
++            let desired_keep_alive = keep_alive_interval(
++                phase,
++                config.keep_alive_interval,
++                config.idle_keep_alive_interval,
++            );
++            if desired_keep_alive != current_keep_alive {
+                 unsafe {
+-                    set_keep_alive(
+-                        cnx,
+-                        keep_alive_interval(
+-                            streams_len_for_sleep,
+-                            config.keep_alive_interval,
+-                            config.idle_keep_alive_interval,
+-                        ),
+-                    );
++                    set_keep_alive(cnx, desired_keep_alive);
+                 }
+-                active_streams = has_active_streams;
++                current_keep_alive = desired_keep_alive;
+             }
+-            let mut has_work = streams_len_for_sleep > 0;
++            let mut transport_fast_work = false;
+             for resolver in resolvers.iter_mut() {
+                 if !refresh_resolver_path(cnx, resolver) {
+                     continue;
+                 }
+                 let pending_for_sleep = match resolver.mode {
+                     ResolverMode::Authoritative => {
+-                        if streams_len_for_sleep == 0 {
+-                            0
+-                        } else {
++                        let pacing_deficit = if phase == SchedulerPhase::Busy {
+                             let quality = fetch_path_quality(cnx, resolver);
+                             let snapshot = resolver
+                                 .pacing_budget
+@@ -328,25 +456,30 @@ pub async fn run_client(
+                             let inflight_packets =
+                                 inflight_packet_estimate(quality.bytes_in_transit, mtu);
+                             target.saturating_sub(inflight_packets)
+-                        }
++                        } else {
++                            resolver.last_pacing_snapshot = None;
++                            0
++                        };
++                        authoritative_poll_budget(
++                            phase,
++                            pacing_deficit,
++                            scheduler.sparse_poll_due(current_time),
++                            has_ready_stream_for_sleep,
++                            flow_blocked_for_sleep,
++                        )
+                     }
+                     ResolverMode::Recursive => resolver.pending_polls,
+                 };
+-                if pending_for_sleep > 0 {
+-                    has_work = true;
+-                }
+-                if resolver.mode == ResolverMode::Authoritative
+-                    && !resolver.inflight_poll_ids.is_empty()
+-                {
+-                    has_work = true;
++                if resolver.mode == ResolverMode::Recursive && pending_for_sleep > 0 {
++                    transport_fast_work = true;
+                 }
+             }
+-            // Avoid a tight poll loop when idle, but keep the short slice during active transfers.
+-            let timeout_us = if has_work {
+-                delay_us.clamp(1, DNS_POLL_SLICE_US)
+-            } else {
+-                delay_us.max(1)
+-            };
++            let timeout_us = scheduler.timeout_us(
++                delay_us,
++                current_time,
++                last_activity_at,
++                transport_fast_work,
++            );
+             let timeout = Duration::from_micros(timeout_us);
+ 
+             tokio::select! {
+@@ -484,8 +617,15 @@ pub async fn run_client(
+             let has_ready_stream = unsafe { slipstream_has_ready_stream(cnx) != 0 };
+             let flow_blocked = unsafe { slipstream_is_flow_blocked(cnx) != 0 };
+             let streams_len = unsafe { (*state_ptr).streams_len() };
++            let now = unsafe { picoquic_current_time() };
++            let phase = scheduler.update(
++                streams_len,
++                unsafe { (*state_ptr).last_activity_at() },
++                now,
++                has_ready_stream,
++                flow_blocked,
++            );
+             if streams_len > 0 && has_ready_stream && flow_blocked {
+-                let now = unsafe { picoquic_current_time() };
+                 if now.saturating_sub(last_flow_block_log_at) >= FLOW_BLOCKED_LOG_INTERVAL_US {
+                     let metrics = unsafe { (*state_ptr).stream_debug_metrics() };
+                     let backlog = unsafe { (*state_ptr).stream_backlog_summaries(8) };
+@@ -529,14 +669,13 @@ pub async fn run_client(
+                             .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
+                         let inflight_packets =
+                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
+-                        let mut poll_deficit = pacing_target.saturating_sub(inflight_packets);
+-                        if !authoritative_polling_needed(
+-                            streams_len,
++                        let poll_deficit = authoritative_poll_budget(
++                            phase,
++                            pacing_target.saturating_sub(inflight_packets),
++                            scheduler.sparse_poll_due(now),
+                             has_ready_stream,
+                             flow_blocked,
+-                        ) {
+-                            poll_deficit = 0;
+-                        }
++                        );
+                         if poll_deficit > 0 && resolver.debug.enabled {
+                             debug!(
+                                 "cc_state: {} cwnd={} in_transit={} rtt_us={} flow_blocked={} deficit={}",
+@@ -549,8 +688,11 @@ pub async fn run_client(
+                             );
+                         }
+                         if poll_deficit > 0 {
+-                            let burst_max = path_poll_burst_max(resolver);
+-                            let mut to_send = poll_deficit.min(burst_max);
++                            let mut to_send = if phase == SchedulerPhase::Busy {
++                                poll_deficit.min(path_poll_burst_max(resolver))
++                            } else {
++                                1
++                            };
+                             send_poll_queries(
+                                 cnx,
+                                 &udp,
+@@ -562,6 +704,9 @@ pub async fn run_client(
+                                 &mut send_buf,
+                             )
+                             .await?;
++                            if phase.poll_interval_us().is_some() {
++                                scheduler.record_sparse_poll(now, to_send == 0);
++                            }
+                         }
+                     }
+                     ResolverMode::Recursive => {
+@@ -671,19 +816,118 @@ pub async fn run_client(
+ 
+ #[cfg(test)]
+ mod adaptive_idle_tests {
+-    use super::{authoritative_polling_needed, keep_alive_interval};
++    use super::{
++        authoritative_poll_budget, keep_alive_interval, scheduler_phase, ActivityScheduler,
++        SchedulerPhase, DNS_POLL_SLICE_US,
++    };
+ 
+     #[test]
+-    fn selects_idle_and_active_keep_alive() {
+-        assert_eq!(keep_alive_interval(0, 400, 5000), 5000);
+-        assert_eq!(keep_alive_interval(1, 400, 5000), 400);
++    fn derives_activity_phases() {
++        assert_eq!(
++            scheduler_phase(0, 0, 2_000_000, false, false),
++            SchedulerPhase::Empty
++        );
++        assert_eq!(
++            scheduler_phase(1, 1_700_001, 2_000_000, false, false),
++            SchedulerPhase::Busy
++        );
++        assert_eq!(
++            scheduler_phase(1, 1_500_000, 2_000_000, false, false),
++            SchedulerPhase::Warm
++        );
++        assert_eq!(
++            scheduler_phase(1, 1_000_000, 2_000_000, false, false),
++            SchedulerPhase::QuiescentOpen
++        );
++        assert_eq!(
++            scheduler_phase(1, 0, 2_000_000, true, false),
++            SchedulerPhase::Busy
++        );
++        assert_eq!(
++            scheduler_phase(1, 0, 2_000_000, false, true),
++            SchedulerPhase::Busy
++        );
+     }
+ 
+     #[test]
+-    fn suppresses_authoritative_polls_without_streams() {
+-        assert!(!authoritative_polling_needed(0, false, true));
+-        assert!(authoritative_polling_needed(1, false, false));
+-        assert!(authoritative_polling_needed(1, true, true));
+-        assert!(!authoritative_polling_needed(1, true, false));
++    fn selects_keep_alive_and_poll_budgets() {
++        assert_eq!(keep_alive_interval(SchedulerPhase::Busy, 400, 5000), 400);
++        assert_eq!(keep_alive_interval(SchedulerPhase::Warm, 400, 5000), 5000);
++        assert_eq!(
++            keep_alive_interval(SchedulerPhase::QuiescentOpen, 400, 5000),
++            5000
++        );
++        assert_eq!(keep_alive_interval(SchedulerPhase::Empty, 400, 5000), 5000);
++        assert_eq!(
++            authoritative_poll_budget(SchedulerPhase::Busy, 7, false, false, false),
++            7
++        );
++        assert_eq!(
++            authoritative_poll_budget(SchedulerPhase::Busy, 7, false, true, false),
++            0
++        );
++        assert_eq!(
++            authoritative_poll_budget(SchedulerPhase::Busy, 7, false, true, true),
++            7
++        );
++        assert_eq!(
++            authoritative_poll_budget(SchedulerPhase::Warm, 7, true, false, false),
++            1
++        );
++        assert_eq!(
++            authoritative_poll_budget(SchedulerPhase::Warm, 7, false, false, false),
++            0
++        );
++        assert_eq!(
++            authoritative_poll_budget(SchedulerPhase::QuiescentOpen, 7, true, false, false),
++            1
++        );
++        assert_eq!(
++            authoritative_poll_budget(SchedulerPhase::Empty, 7, true, false, true),
++            0
++        );
++    }
++
++    #[test]
++    fn sparse_deadlines_beat_or_yield_to_quic() {
++        let mut scheduler = ActivityScheduler::default();
++        assert_eq!(
++            scheduler.update(1, 0, 1_000_000, false, false),
++            SchedulerPhase::QuiescentOpen
++        );
++        assert!(scheduler.sparse_poll_due(1_000_000));
++        scheduler.record_sparse_poll(1_000_000, true);
++        assert_eq!(
++            scheduler.timeout_us(5_000_000, 1_000_000, 0, false),
++            2_000_000
++        );
++        assert_eq!(scheduler.timeout_us(17_000, 1_000_000, 0, false), 17_000);
++        scheduler.record_sparse_poll(1_000_000, false);
++        assert_eq!(
++            scheduler.timeout_us(5_000_000, 1_000_000, 0, false),
++            DNS_POLL_SLICE_US
++        );
++    }
++
++    #[test]
++    fn busy_keeps_short_slice_without_clamping_sparse_phases() {
++        let mut scheduler = ActivityScheduler::default();
++        assert_eq!(
++            scheduler.update(1, 900_000, 1_000_000, false, false),
++            SchedulerPhase::Busy
++        );
++        assert_eq!(
++            scheduler.timeout_us(5_000_000, 1_000_000, 900_000, false),
++            DNS_POLL_SLICE_US
++        );
++        assert_eq!(
++            scheduler.update(1, 500_000, 1_000_000, false, false),
++            SchedulerPhase::Warm
++        );
++        scheduler.record_sparse_poll(1_000_000, true);
++        assert_eq!(
++            scheduler.timeout_us(5_000_000, 1_000_000, 500_000, false),
++            400_000
++        );
+     }
+ }
+diff --git a/crates/slipstream-client/src/streams.rs b/crates/slipstream-client/src/streams.rs
+index cdc7176..66538ca 100644
+--- a/crates/slipstream-client/src/streams.rs
++++ b/crates/slipstream-client/src/streams.rs
+@@ -36,6 +36,7 @@ pub(crate) struct ClientState {
+     acceptor: acceptor::ClientAcceptor,
+     debug_enqueued_bytes: u64,
+     debug_last_enqueue_at: u64,
++    last_activity_at: u64,
+     acceptor_limit_logged: bool,
+ }
+ 
+@@ -489,6 +490,7 @@ impl ClientState {
+             acceptor,
+             debug_enqueued_bytes: 0,
+             debug_last_enqueue_at: 0,
++            last_activity_at: 0,
+             acceptor_limit_logged: false,
+         }
+     }
+@@ -505,6 +507,14 @@ impl ClientState {
+         self.streams.len()
+     }
+ 
++    pub(crate) fn last_activity_at(&self) -> u64 {
++        self.last_activity_at
++    }
++
++    fn mark_activity(&mut self) {
++        self.last_activity_at = unsafe { picoquic_current_time() };
++    }
++
+     pub(crate) fn update_acceptor_limit(&mut self, cnx: *mut picoquic_cnx_t) {
+         let max_streams = self.acceptor.update_limit(cnx);
+         if !self.acceptor_limit_logged && max_streams > 0 {
+@@ -604,6 +614,7 @@ impl ClientState {
+         self.acceptor.reset();
+         self.debug_enqueued_bytes = 0;
+         self.debug_last_enqueue_at = 0;
++        self.last_activity_at = 0;
+         self.acceptor_limit_logged = false;
+     }
+ }
+@@ -840,6 +851,7 @@ fn handle_stream_data(
+     fin: bool,
+     data: &[u8],
+ ) {
++    let activity = !data.is_empty() || fin;
+     let debug_streams = state.debug_streams;
+     let mut reset_stream = false;
+     let mut remove_stream = false;
+@@ -944,6 +956,10 @@ fn handle_stream_data(
+         }
+     }
+ 
++    if activity {
++        state.mark_activity();
++    }
++
+     if reset_stream {
+         if debug_streams {
+             debug!("stream {}: resetting", stream_id);
+@@ -1073,6 +1089,10 @@ mod tests {
+             matches!(write_rx.try_recv(), Ok(StreamWrite::Fin)),
+             "expected a TCP fin to be enqueued"
+         );
++        assert!(
++            state.last_activity_at() > 0,
++            "remote fin should restore active scheduling"
++        );
+     }
+ 
+     #[test]
+@@ -1383,6 +1403,7 @@ pub(crate) fn handle_command(
+                     flow: FlowControlState::default(),
+                 },
+             );
++            state.mark_activity();
+             spawn_client_reader(
+                 stream_id,
+                 read_half,
+@@ -1446,10 +1467,12 @@ pub(crate) fn handle_command(
+                 state.debug_enqueued_bytes =
+                     state.debug_enqueued_bytes.saturating_add(data.len() as u64);
+                 state.debug_last_enqueue_at = now;
++                state.last_activity_at = now;
+             }
+             check_stream_invariants(state, stream_id, "StreamData");
+         }
+         Command::StreamClosed { stream_id } => {
++            let mut fin_queued = false;
+             let should_send_fin = state
+                 .streams
+                 .get(&stream_id)
+@@ -1483,11 +1506,15 @@ pub(crate) fn handle_command(
+                 }
+                 state.streams.remove(&stream_id);
+             } else if let Some(stream) = state.streams.get_mut(&stream_id) {
++                fin_queued = true;
+                 stream.send_state = StreamSendState::FinQueued;
+                 if stream.recv_state.is_closed() && stream.flow.queued_bytes == 0 {
+                     state.streams.remove(&stream_id);
+                 }
+             }
++            if fin_queued {
++                state.mark_activity();
++            }
+             check_stream_invariants(state, stream_id, "StreamClosed");
+         }
+         Command::StreamReadError { stream_id } => {

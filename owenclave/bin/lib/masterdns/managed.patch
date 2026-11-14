@@ -1,0 +1,89 @@
+diff --git a/internal/client/async_runtime.go b/internal/client/async_runtime.go
+--- a/internal/client/async_runtime.go
++++ b/internal/client/async_runtime.go
+@@ -331,10 +331,12 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
+ 		c.tunnelRX_TX_Workers, c.tunnelProcessWorkers)
+ 
+ 	// Start TCP/SOCKS Proxy Listener
+-	c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
+-	if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
+-		c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
+-		return err
++	if !c.cfg.OwenclaveManaged {
++		c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
++		if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
++			c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
++			return err
++		}
+ 	}
+ 
+ 	// Start DNS Listener if enabled
+diff --git a/internal/client/ping_manager.go b/internal/client/ping_manager.go
+--- a/internal/client/ping_manager.go
++++ b/internal/client/ping_manager.go
+@@ -104,6 +104,9 @@ func (p *PingManager) wake(now int64) {
+ }
+ 
+ func (p *PingManager) nextInterval(nowNano int64) time.Duration {
++	if p.client.cfg.OwenclaveManaged {
++		return p.owenclaveInterval(nowNano)
++	}
+ 	lastNonPingSent := p.lastNonPingSentAt.Load()
+ 	lastNonPongRecv := p.lastNonPongReceivedAt.Load()
+ 
+@@ -136,6 +139,10 @@ func (p *PingManager) nextInterval(nowNano int64) time.Duration {
+ func (p *PingManager) pingLoop() {
+ 	defer p.wg.Done()
++	if p.client.cfg.OwenclaveManaged {
++		p.owenclaveLoop()
++		return
++	}
+ 
+ 	p.client.log.Debugf("\U0001F3D3 <cyan>Ping Manager loop started</cyan>")
+ 	timer := time.NewTimer(p.client.cfg.PingAggressiveInterval())
+ 	defer timer.Stop()
+diff --git a/internal/client/stream_client.go b/internal/client/stream_client.go
+--- a/internal/client/stream_client.go
++++ b/internal/client/stream_client.go
+@@ -157,3 +157,6 @@
+ 	a := arq.NewARQ(streamID, c.sessionID, s, conn, mtu, c.log, arqCfg)
++	if c.cfg.OwenclaveManaged {
++		a.LimitSendWindow(48)
++	}
+ 	s.Stream = a
+ 	a.Start()
+diff --git a/internal/config/client.go b/internal/config/client.go
+--- a/internal/config/client.go
++++ b/internal/config/client.go
+@@ -24,6 +24,7 @@ import (
+ )
+ 
+ type ClientConfig struct {
++	OwenclaveManaged                     bool              `toml:"-"`
+ 	ConfigDir                             string            `toml:"-"`
+ 	ConfigPath                            string            `toml:"-"`
+ 	ResolversFilePath                     string            `toml:"-"`
+diff --git a/internal/config/server.go b/internal/config/server.go
+--- a/internal/config/server.go
++++ b/internal/config/server.go
+@@ -25,6 +25,7 @@ import (
+ )
+ 
+ type ServerConfig struct {
++	OwenclaveFixedTarget              bool     `toml:"-"`
+ 	ConfigDir                         string   `toml:"-"`
+ 	ConfigPath                        string   `toml:"-"`
+ 	ProtocolType                      string   `toml:"PROTOCOL_TYPE"`
+diff --git a/internal/udpserver/server_postsession.go b/internal/udpserver/server_postsession.go
+--- a/internal/udpserver/server_postsession.go
++++ b/internal/udpserver/server_postsession.go
+@@ -45,6 +45,9 @@ func (s *Server) handlePostSessionPacket(vpnPacket VpnProto.Packet, sessionRecor
+ }
+ 
+ func (s *Server) dispatchPostSessionPacket(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
++	if s.cfg.OwenclaveFixedTarget && (vpnPacket.PacketType == Enums.PACKET_DNS_QUERY_REQ || vpnPacket.PacketType == Enums.PACKET_SOCKS5_SYN) {
++		return false
++	}
+ 	switch vpnPacket.PacketType {
+ 	case Enums.PACKET_PING:
+ 		return true

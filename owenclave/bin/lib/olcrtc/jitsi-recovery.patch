@@ -1,0 +1,555 @@
+diff --git a/internal/client/client.go b/internal/client/client.go
+index b5f55f7..16b7fdf 100644
+--- a/internal/client/client.go
++++ b/internal/client/client.go
+@@ -65,7 +65,14 @@ type Client struct {
+ 	controlStop context.CancelFunc
+ 	sessMu      sync.RWMutex
+ 	reconnectMu sync.Mutex
+-	health      *runtime.HealthTracker
++	// ai-generated: serialized recovery ownership, guarded by reconnectMu.
++	recoveryRequests chan recoveryRequest
++	recoveryCtx      context.Context //nolint:containedctx // requests inherit the worker lifetime.
++	recoveryCancel   context.CancelFunc
++	recoveryStop     context.CancelFunc
++	recoveryDone     chan struct{}
++	stopped          bool
++	health           *runtime.HealthTracker
+ 	// ai-generated: new field, peer-restart-corroboration PR.
+ 	//
+ 	// controlLastPong tracks the last successful control pong (as a
+@@ -227,10 +234,7 @@ func (c *Client) bringUpLink(
+ 		if ctx.Err() != nil {
+ 			return
+ 		}
+-		// Carrier callback fires after the link is back up. If handshake
+-		// still fails it usually means the server hasn't completed its
+-		// own reinstall yet - keep the listener up and wait for either
+-		// another callback or a future liveness loss to re-trigger.
++		// ai-generated: enqueue recovery without blocking the carrier supervisor.
+ 		c.handleReconnect(ctx, cfg, cancel, "carrier")
+ 	})
+ 
+@@ -281,8 +285,10 @@ func (c *Client) bringUpLink(
+ 	c.sessMu.Unlock()
+ 	c.signalSessionReady()
+ 	c.recordSession(sid)
+-	c.startControlLoop(ctx, cfg, cancel, control)
+ 
++	// ai-generated: start the single recovery owner before the carrier supervisor.
++	c.startRecovery(ctx, cfg, cancel)
++	c.startControlLoop(ctx, cfg, cancel, control)
+ 	go ln.WatchConnection(ctx)
+ 	return nil
+ }
+@@ -432,10 +438,8 @@ func linkMaxPayload(tr transport.Transport) int {
+ 	return runtime.MaxPayload(tr)
+ }
+ 
+-func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context.CancelFunc, reason string) {
+-	c.reconnectMu.Lock()
+-	defer c.reconnectMu.Unlock()
+-
++// ai-generated: session teardown runs only on the client recovery worker.
++func (c *Client) prepareReconnect(reason string) {
+ 	c.recordReconnect()
+ 	logger.Infof("client reconnect reason=%s - tearing down smux session", reason)
+ 	c.resetLinkPeer()
+@@ -488,17 +492,10 @@ func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context
+ 	// reconnect callback which then drives a fresh handshake.
+ 	if reason == "liveness" && c.ln != nil {
+ 		c.ln.Reconnect("liveness")
+-		// Return immediately - retryHandshake over the dead link would
+-		// loop forever with "open control stream: timeout" while holding
+-		// reconnectMu, blocking the carrier callback that fires once the
+-		// link is actually back up. Let that callback (reason="carrier")
+-		// drive the handshake when the transport is ready.
+-		return
+ 	}
+-
+-	c.retryHandshake(ctx, cfg, cancel, reason)
+ }
+ 
++// ai-generated: keep retrying with bounded pacing until success or cancellation.
+ func (c *Client) retryHandshake(ctx context.Context, cfg Config, cancel context.CancelFunc, reason string) {
+ 	const (
+ 		initialDelay = 300 * time.Millisecond
+@@ -513,16 +510,6 @@ func (c *Client) retryHandshake(ctx context.Context, cfg Config, cancel context.
+ 		if c.tryReopenSession(ctx, cfg, cancel, attempt) {
+ 			return
+ 		}
+-		// Don't fail the whole process on liveness reconnect: the carrier
+-		// rebuild may take dozens of seconds (e.g. ICE restart on a flaky
+-		// network). Keep the SOCKS5 listener open and wait - handleSocks5
+-		// will return host-unreachable to clients until we recover. For
+-		// carrier-driven reconnects the callback fires after the link is
+-		// already up, so a missed handshake is more suspicious; cap it.
+-		if reason == "carrier" && attempt >= 5 {
+-			logger.Warnf("client reconnect: exhausted %d handshake attempts (reason=%s) - keeping listener up", attempt, reason)
+-			return
+-		}
+ 		select {
+ 		case <-ctx.Done():
+ 			return
+@@ -602,22 +589,22 @@ func (c *Client) tryReopenSession(
+ 		}
+ 		return false
+ 	}
+-	logger.Infof("session %s reopened (device=%s)", sid, c.deviceID)
+-	c.sessMu.Lock()
+-	c.session = sess
+-	c.controlStrm = ctrlStream
+-	c.sessionID = sid
+-	c.sessMu.Unlock()
+-	c.signalSessionReady()
++	// ai-generated: reject stale success before publishing the session.
++	if !c.publishReopenedSession(ctx, cfg, cancel, sess, ctrlStream, sid) {
++		_ = sess.Close()
++		if controlSess != sess {
++			_ = controlSess.Close()
++		}
++		return false
++	}
+ 	c.recordSession(sid)
+-	c.startControlLoop(ctx, cfg, cancel, ctrlStream)
+ 	return true
+ }
+ 
+ func (c *Client) startControlLoop(
+ 	ctx context.Context,
+ 	cfg Config,
+-	cancel context.CancelFunc,
++	_ context.CancelFunc,
+ 	stream *smux.Stream,
+ ) {
+ 	controlCtx, stop := context.WithCancel(ctx)
+@@ -682,9 +669,8 @@ func (c *Client) startControlLoop(
+ 		if err != nil {
+ 			logger.Warnf("client control stream ended: %v", err)
+ 		}
+-		// handleReconnect now retries indefinitely on liveness so it only
+-		// returns false on ctx cancellation; don't tear down the client.
+-		c.handleReconnect(ctx, cfg, cancel, "liveness")
++		// ai-generated: reject a retired control loop before requesting recovery.
++		c.requestLiveRecovery(ctx, controlCtx)
+ 	}()
+ }
+ 
+@@ -767,6 +753,8 @@ func (c *Client) readyChannel() chan struct{} {
+ }
+ 
+ func (c *Client) shutdown() {
++	// ai-generated: cancel and join recovery before closing shared session state.
++	c.stopRecovery()
+ 	c.sessMu.Lock()
+ 	control := c.controlStrm
+ 	controlStop := c.controlStop
+diff --git a/internal/client/recovery.go b/internal/client/recovery.go
+new file mode 100644
+--- /dev/null
++++ b/internal/client/recovery.go
+@@ -0,0 +1,114 @@
++package client
++
++import (
++	"context"
++
++	"github.com/openlibrecommunity/olcrtc/internal/logger"
++	"github.com/xtaci/smux"
++)
++
++// ai-generated: one pending replacement for a cancelled recovery attempt.
++type recoveryRequest struct {
++	ctx    context.Context //nolint:containedctx // queued work carries its own cancellable generation.
++	reason string
++}
++
++// ai-generated: start the single client-owned recovery execution path.
++func (c *Client) startRecovery(ctx context.Context, cfg Config, cancel context.CancelFunc) {
++	c.reconnectMu.Lock()
++	defer c.reconnectMu.Unlock()
++	workerCtx, stop := context.WithCancel(ctx)
++	c.recoveryCtx = workerCtx
++	c.recoveryStop = stop
++	c.recoveryRequests = make(chan recoveryRequest, 1)
++	c.recoveryDone = make(chan struct{})
++	go func() {
++		defer close(c.recoveryDone)
++		for {
++			select {
++			case <-workerCtx.Done():
++				return
++			case req := <-c.recoveryRequests:
++				if req.ctx.Err() != nil {
++					continue
++				}
++				c.prepareReconnect(req.reason)
++				if req.reason != "liveness" {
++					//nolint:contextcheck // requests inherit workerCtx with replacement cancellation.
++					c.retryHandshake(req.ctx, cfg, cancel, req.reason)
++				}
++			}
++		}
++	}()
++}
++
++// ai-generated: reject liveness recovery from a retired control session.
++func (c *Client) requestLiveRecovery(ctx, controlCtx context.Context) {
++	c.reconnectMu.Lock()
++	defer c.reconnectMu.Unlock()
++	if controlCtx.Err() == nil {
++		c.requestRecovery(ctx, "liveness")
++	}
++}
++
++// ai-generated: publication is atomic with recovery cancellation and shutdown.
++func (c *Client) publishReopenedSession(
++	ctx context.Context, cfg Config, cancel context.CancelFunc,
++	sess *smux.Session, stream *smux.Stream, sid string,
++) bool {
++	c.reconnectMu.Lock()
++	defer c.reconnectMu.Unlock()
++	if ctx.Err() != nil || c.stopped {
++		return false
++	}
++	logger.Infof("session %s reopened (device=%s)", sid, c.deviceID)
++	c.sessMu.Lock()
++	c.session = sess
++	c.controlStrm = stream
++	c.sessionID = sid
++	c.sessMu.Unlock()
++	c.signalSessionReady()
++	c.startControlLoop(ctx, cfg, cancel, stream)
++	return true
++}
++
++// ai-generated: callbacks only cancel stale work and enqueue a replacement.
++func (c *Client) handleReconnect(ctx context.Context, _ Config, _ context.CancelFunc, reason string) {
++	c.reconnectMu.Lock()
++	defer c.reconnectMu.Unlock()
++	c.requestRecovery(ctx, reason)
++}
++
++// ai-generated: called with reconnectMu held, coalescing pending requests.
++func (c *Client) requestRecovery(ctx context.Context, reason string) {
++	if ctx.Err() != nil || c.stopped || c.recoveryRequests == nil {
++		return
++	}
++	if c.recoveryCancel != nil {
++		c.recoveryCancel()
++	}
++	attemptCtx, stop := context.WithCancel(c.recoveryCtx)
++	c.recoveryCancel = stop
++	select {
++	case <-c.recoveryRequests:
++	default:
++	}
++	c.recoveryRequests <- recoveryRequest{ctx: attemptCtx, reason: reason}
++}
++
++// ai-generated: stop rejects further requests and waits for recovery cleanup.
++func (c *Client) stopRecovery() {
++	c.reconnectMu.Lock()
++	c.stopped = true
++	if c.recoveryCancel != nil {
++		c.recoveryCancel()
++	}
++	if c.recoveryStop != nil {
++		c.recoveryStop()
++	}
++	done := c.recoveryDone
++	c.reconnectMu.Unlock()
++	if done != nil {
++		<-done
++	}
++}
+diff --git a/internal/client/recovery_test.go b/internal/client/recovery_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/client/recovery_test.go
+@@ -0,0 +1,197 @@
++package client
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/openlibrecommunity/olcrtc/internal/control"
++	"github.com/openlibrecommunity/olcrtc/internal/handshake"
++	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
++	"github.com/openlibrecommunity/olcrtc/internal/runtime"
++	"github.com/xtaci/smux"
++)
++
++// ai-generated: in-memory recovery carrier with controllable peer readiness.
++type recoveryLink struct {
++	closerLinkStub
++	wait    func(context.Context) error
++	send    func([]byte) error
++	rebuild chan struct{}
++}
++
++// ai-generated: controllable peer readiness for recovery tests.
++func (l *recoveryLink) WaitForPeer(ctx context.Context) error { return l.wait(ctx) }
++
++// ai-generated: forward encrypted smux frames to the test peer.
++func (l *recoveryLink) Send(data []byte) error { return l.send(data) }
++
++// ai-generated: observe liveness requesting a carrier rebuild.
++func (l *recoveryLink) Reconnect(string) { l.rebuild <- struct{}{} }
++
++// ai-generated: bounded channel wait for recovery regression tests.
++func awaitRecovery[T any](t *testing.T, ch <-chan T) T {
++	t.Helper()
++	select {
++	case v := <-ch:
++		return v
++	case <-time.After(20 * time.Second):
++		t.Fatal("recovery event timed out")
++		var zero T
++		return zero
++	}
++}
++
++// ai-generated: initialize one recovery owner without a real carrier.
++func newRecoveryClient(t *testing.T, ln *recoveryLink) (*Client, context.Context, context.CancelFunc) {
++	t.Helper()
++	cipher, err := setupCipher("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	c := &Client{ln: ln, cipher: cipher, deviceID: "recovery-test",
++		health: runtime.NewHealthTracker(nil), sessionReady: make(chan struct{})}
++	c.startRecovery(ctx, Config{Liveness: control.Config{Interval: time.Hour}}, cancel)
++	t.Cleanup(func() { cancel(); c.shutdown() })
++	return c, ctx, cancel
++}
++
++// ai-generated: exercise real encrypted handshakes beyond the former five-attempt budget.
++func TestRecoveryHandshakeBudgetThenSuccess(t *testing.T) {
++	ln := &recoveryLink{}
++	c, ctx, cancel := newRecoveryClient(t, ln)
++	var mu sync.Mutex
++	var peer *muxconn.Conn
++	var peerSess *smux.Session
++	attempts := 0
++	ln.send = func(data []byte) error {
++		mu.Lock()
++		conn := peer
++		mu.Unlock()
++		if conn != nil {
++			conn.Push(data)
++		}
++		return nil
++	}
++	ln.wait = func(context.Context) error {
++		mu.Lock()
++		defer mu.Unlock()
++		if peerSess != nil {
++			_ = peerSess.Close()
++		}
++		attempts++
++		attempt := attempts
++		serverLink := &recoveryLink{send: func(data []byte) error { c.onData(data); return nil }}
++		peer = muxconn.New(serverLink, c.cipher)
++		var err error
++		peerSess, err = smux.Server(peer, smuxConfig(0))
++		if err != nil {
++			return fmt.Errorf("test smux server: %w", err)
++		}
++		sess := peerSess
++		go func() {
++			stream, acceptErr := sess.AcceptStream()
++			if acceptErr != nil {
++				return
++			}
++			_, _, _ = handshake.Server(stream, func(string, map[string]any) (string, error) {
++				if attempt <= 5 {
++					return "", ErrRemoteNotReady
++				}
++				return "recovered", nil
++			})
++		}()
++		return nil
++	}
++	t.Cleanup(func() {
++		cancel()
++		c.stopRecovery()
++		mu.Lock()
++		defer mu.Unlock()
++		if peerSess != nil {
++			_ = peerSess.Close()
++		}
++	})
++	ready := c.readyChannel()
++	c.handleReconnect(ctx, Config{}, cancel, "carrier")
++	awaitRecovery(t, ready)
++	c.sessMu.RLock()
++	defer c.sessMu.RUnlock()
++	if c.sessionID != "recovered" || c.session == nil {
++		t.Fatalf("session did not recover: %q", c.sessionID)
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	if attempts != 6 {
++		t.Fatalf("attempts = %d, want 6", attempts)
++	}
++}
++
++// ai-generated: carrier callbacks return while peer wait is blocked; replacement and Stop cancel it.
++func TestRecoveryCallbackCancellationAndStop(t *testing.T) {
++	ln := &recoveryLink{send: func([]byte) error { return nil }}
++	c, ctx, cancel := newRecoveryClient(t, ln)
++	started := make(chan context.Context, 2)
++	ln.wait = func(ctx context.Context) error {
++		started <- ctx
++		<-ctx.Done()
++		return fmt.Errorf("test peer wait: %w", ctx.Err())
++	}
++	callbackDone := make(chan struct{})
++	go func() { c.handleReconnect(ctx, Config{}, cancel, "carrier"); close(callbackDone) }()
++	awaitRecovery(t, callbackDone)
++	first := awaitRecovery(t, started)
++	// ai-generated: replacement inherits the client lifetime, not its cancelled predecessor.
++	c.handleReconnect(first, Config{}, cancel, "carrier")
++	awaitRecovery(t, first.Done())
++	second := awaitRecovery(t, started)
++	c.stopRecovery()
++	awaitRecovery(t, second.Done())
++	c.handleReconnect(ctx, Config{}, cancel, "carrier")
++	c.sessMu.RLock()
++	defer c.sessMu.RUnlock()
++	if c.session != nil || c.sessionID != "" {
++		t.Fatal("stopped recovery published a session")
++	}
++}
++
++// ai-generated: liveness owns carrier rebuilding and waits for its callback before handshaking.
++func TestRecoveryLivenessWaitsForCarrier(t *testing.T) {
++	ln := &recoveryLink{rebuild: make(chan struct{}, 1), send: func([]byte) error { return nil }}
++	c, ctx, cancel := newRecoveryClient(t, ln)
++	started := make(chan struct{}, 1)
++	ln.wait = func(ctx context.Context) error {
++		started <- struct{}{}
++		<-ctx.Done()
++		return fmt.Errorf("test peer wait: %w", ctx.Err())
++	}
++	c.handleReconnect(ctx, Config{}, cancel, "liveness")
++	awaitRecovery(t, ln.rebuild)
++	select {
++	case <-started:
++		t.Fatal("handshake started before carrier recovery")
++	default:
++	}
++	c.handleReconnect(ctx, Config{}, cancel, "carrier")
++	awaitRecovery(t, started)
++}
++
++// ai-generated: even a successful late handshake cannot publish after cancellation or Stop.
++func TestRecoveryRejectsStalePublication(t *testing.T) {
++	c := &Client{sessionReady: make(chan struct{})}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if c.publishReopenedSession(ctx, Config{}, cancel, nil, nil, "stale") {
++		t.Fatal("cancelled handshake published")
++	}
++	c.stopRecovery()
++	if c.publishReopenedSession(context.Background(), Config{}, cancel, nil, nil, "stale") {
++		t.Fatal("stopped client published")
++	}
++	if c.sessionID != "" {
++		t.Fatal("stale session replaced current state")
++	}
++}
+diff --git a/internal/engine/jitsi/jitsi.go b/internal/engine/jitsi/jitsi.go
+index f7a19ae..22b3102 100644
+--- a/internal/engine/jitsi/jitsi.go
++++ b/internal/engine/jitsi/jitsi.go
+@@ -388,7 +388,8 @@ func (s *Session) Connect(ctx context.Context) error {
+ 	s.wg.Add(5)
+ 	go s.sendLoop()
+ 	go s.recvLoop()
+-	go s.waitForJingle()
++	// ai-generated: initial Jingle setup does not notify session recovery.
++	go s.waitForJingle(false)
+ 	go s.bridgeKeepalive()
+ 	go s.xmppKeepalive()
+ 	return nil
+@@ -403,7 +404,8 @@ func (s *Session) Connect(ctx context.Context) error {
+ // network blip, etc.). On any non-cancellation error we request a
+ // reconnect so the supervisor can rejoin and resume waiting; without
+ // this, a single failed wait permanently wedges the engine.
+-func (s *Session) waitForJingle() {
++// ai-generated: notify recovery when a parked reconnect finally gets a peer.
++func (s *Session) waitForJingle(recovery bool) {
+ 	defer s.wg.Done()
+ 
+ 	jSess := s.jSess.Load()
+@@ -428,7 +430,20 @@ func (s *Session) waitForJingle() {
+ 			logger.Warnf("jitsi: jingle setup failed: %v", err)
+ 			s.requestReconnect("jingle setup failed")
+ 		}
++		return
++	}
++	if recovery {
++		// ai-generated: parked sessions notify only after bridge setup succeeds.
++		s.notifyLatePeerRecovery()
++	}
++}
++
++// ai-generated: late peer readiness follows the carrier reconnect callback contract.
++func (s *Session) notifyLatePeerRecovery() {
++	if s.onReconnect == nil || s.closed.Load() || s.runCtx.Err() != nil {
++		return
+ 	}
++	s.onReconnect(nil)
+ }
+ 
+ // completeJingleSetup opens the bridge and negotiates a PeerConnection only
+@@ -2017,7 +2032,8 @@ func (s *Session) reconnectFull(ctx context.Context) error {
+ 		// Park the session so waitForJingle can pick up later.
+ 		s.jSess.Store(jSess)
+ 		s.wg.Add(1)
+-		go s.waitForJingle()
++		// ai-generated: late peer readiness must wake client session recovery.
++		go s.waitForJingle(true)
+ 		return errNoPeer
+ 	}
+ 
+diff --git a/internal/engine/jitsi/recovery_test.go b/internal/engine/jitsi/recovery_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/engine/jitsi/recovery_test.go
+@@ -0,0 +1,28 @@
++package jitsi
++
++import (
++	"context"
++	"testing"
++
++	"github.com/pion/webrtc/v4"
++)
++
++// ai-generated: parked recovery notifies the client once ready, but not after Stop.
++func TestLatePeerRecoveryCallback(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	calls := 0
++	s := &Session{runCtx: ctx, onReconnect: func(*webrtc.DataChannel) { calls++ }}
++	s.notifyLatePeerRecovery()
++	if calls != 1 {
++		t.Fatalf("recovery callbacks = %d, want 1", calls)
++	}
++	s.closed.Store(true)
++	s.notifyLatePeerRecovery()
++	s.closed.Store(false)
++	cancel()
++	s.notifyLatePeerRecovery()
++	if calls != 1 {
++		t.Fatalf("stopped recovery callbacks = %d, want 1", calls)
++	}
++}

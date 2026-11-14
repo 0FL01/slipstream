@@ -1,0 +1,72 @@
+name: Debug Build
+on:
+  push:
+    branches:
+      - dev*
+    paths:
+      - "app/**"
+      - "buildSrc/**"
+      - "library/**"
+      - ".github/workflows/debug.yml"
+  workflow_dispatch:
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.5
+          cache-dependency-path: "library/core/go.sum"
+      - name: Setup Go Mobile
+        # https://github.com/golang/mobile/blob/c31d5b91ecc32c0d598b8fe8457d244ca0b4e815/cmd/gomobile/init.go#L83
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260803200217-62cee1672c8e
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260803200217-62cee1672c8e
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 21
+          cache: 'gradle'
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+      - name: Native Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./run lib core debug
+          ./bin/lib/olcrtc/build.sh
+          ./bin/lib/slipstream/build.sh
+          test -s app/libs/libexclavecore.aar
+          test -s app/src/main/jniLibs/arm64-v8a/libolcrtc.so
+          test -s app/src/main/jniLibs/arm64-v8a/libslipstream.so
+          ! find app/src/main/jniLibs -type f \( -name libdnstt.so -o -name libnaive.so \) -print -quit | grep -q .
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          path: app/libs/libexclavecore.aar
+          name: "LibExclaveCore"
+      - name: Gradle Cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.gradle
+          key: gradle-debug-${{ hashFiles('**/*.gradle.kts') }}
+      - name: Gradle Build
+        run: |
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          ./gradlew :app:downloadAssets
+          ./gradlew :app:assembleOssDebug
+          APK="app/build/outputs/apk/oss/debug"
+          echo "APK=$APK" >> $GITHUB_ENV
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: APKs
+          path: ${{ env.APK }}

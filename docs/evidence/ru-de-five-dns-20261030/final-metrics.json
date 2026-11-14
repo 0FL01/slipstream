@@ -1,0 +1,153 @@
+{
+  "A": {
+    "download_1MiB": {
+      "median_Mbit_s": 5.460832807317404,
+      "Mbit_s": [
+        6.748705737270233,
+        4.172959877364575
+      ],
+      "seconds": [
+        1.2429950758814812,
+        2.0102297281846404
+      ]
+    },
+    "upload_512KiB": {
+      "median_Mbit_s": 1.1118243306724997,
+      "Mbit_s": [
+        1.05270749981294,
+        1.1709411615320595
+      ],
+      "seconds": [
+        3.984301432967186,
+        3.581993816420436
+      ]
+    },
+    "loaded_upload_512KiB": {
+      "median_Mbit_s": 0.7249233038708316,
+      "Mbit_s": [
+        0.7062082480352353,
+        0.7436383597064279
+      ],
+      "seconds": [
+        5.939188634045422,
+        5.6402469631284475
+      ]
+    },
+    "loaded_upload_completion_p95_s": 5.939188634045422
+  },
+  "B": {
+    "download_1MiB": {
+      "median_Mbit_s": 4.436512575310895,
+      "Mbit_s": [
+        3.523840040269943,
+        5.349185110351849
+      ],
+      "seconds": [
+        2.3805303033441305,
+        1.5682029742747545
+      ]
+    },
+    "upload_512KiB": {
+      "median_Mbit_s": 1.0882338851167115,
+      "Mbit_s": [
+        1.1679284143603907,
+        1.0085393558730322
+      ],
+      "seconds": [
+        3.5912338020280004,
+        4.158790607005358
+      ]
+    },
+    "loaded_upload_512KiB": {
+      "median_Mbit_s": 1.0987381029987808,
+      "Mbit_s": [
+        1.027438956496119,
+        1.1700372495014424
+      ],
+      "seconds": [
+        4.082290216349065,
+        3.5847610849887133
+      ]
+    },
+    "loaded_upload_completion_p95_s": 4.082290216349065
+  },
+  "paired_download_median_change_pct": -9.799058743468159,
+  "foreground": {
+    "successes": 48,
+    "attempts": 48
+  },
+  "pool": {
+    "successes": 8,
+    "attempts": 10
+  },
+  "cleanups": 9,
+  "confirmation_pairs": 0,
+  "sampled_native_peak_rss_bytes": 11931648,
+  "sampled_native_peak_rss_MiB": 11.37890625,
+  "per_path_useful_bytes_measured": false,
+  "candidate_adapter_counts": [
+    [
+      [
+        14079,
+        13212,
+        274
+      ],
+      [
+        2951,
+        2923,
+        43
+      ],
+      [
+        4992,
+        4455,
+        957
+      ],
+      [
+        16528,
+        15286,
+        113
+      ],
+      [
+        3,
+        3,
+        0
+      ]
+    ],
+    [
+      [
+        14437,
+        12930,
+        284
+      ],
+      [
+        5494,
+        5313,
+        43
+      ],
+      [
+        2077,
+        1715,
+        955
+      ],
+      [
+        15417,
+        14196,
+        121
+      ],
+      [
+        941,
+        941,
+        897
+      ]
+    ]
+  ],
+  "restoration": {
+    "original_frontends": "2026-10-30T21:05:40Z",
+    "original_files9_match": true,
+    "stateless_nft_match": true,
+    "warp_pid": 599,
+    "ra74_root_ssh_after_restore": true,
+    "ru_de_temp_workspaces_removed": true,
+    "local_secret_files_removed": 7
+  }
+}

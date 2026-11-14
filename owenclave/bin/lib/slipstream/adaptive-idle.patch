@@ -1,0 +1,190 @@
+diff --git a/crates/slipstream-client/src/main.rs b/crates/slipstream-client/src/main.rs
+--- a/crates/slipstream-client/src/main.rs
++++ b/crates/slipstream-client/src/main.rs
+@@ -54,6 +54,8 @@ struct Args {
+     cert: Option<String>,
+     #[arg(long = "keep-alive-interval", short = 't', default_value_t = 400)]
+     keep_alive_interval: u16,
++    #[arg(long = "idle-keep-alive-interval", default_value_t = 5000)]
++    idle_keep_alive_interval: u16,
+     #[arg(long = "debug-poll")]
+     debug_poll: bool,
+     #[arg(long = "debug-streams")]
+@@ -187,6 +189,7 @@ fn main() {
+         domain: &domain,
+         cert: cert.as_deref(),
+         keep_alive_interval: keep_alive_interval as usize,
++        idle_keep_alive_interval: args.idle_keep_alive_interval as usize,
+         debug_poll: args.debug_poll,
+         debug_streams: args.debug_streams,
+     };
+diff --git a/crates/slipstream-client/src/runtime.rs b/crates/slipstream-client/src/runtime.rs
+--- a/crates/slipstream-client/src/runtime.rs
++++ b/crates/slipstream-client/src/runtime.rs
+@@ -47,6 +47,30 @@ const SLIPSTREAM_ALPN: &str = "picoquic_sample";
+ const SLIPSTREAM_SNI: &str = "test.example.com";
+ const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
+ const DNS_POLL_SLICE_US: u64 = 50_000;
++
++fn keep_alive_interval(streams: usize, active: usize, idle: usize) -> usize {
++    if streams == 0 {
++        idle
++    } else {
++        active
++    }
++}
++
++fn authoritative_polling_needed(
++    streams: usize,
++    has_ready_stream: bool,
++    flow_blocked: bool,
++) -> bool {
++    streams > 0 && !(has_ready_stream && !flow_blocked)
++}
++
++unsafe fn set_keep_alive(cnx: *mut picoquic_cnx_t, interval: usize) {
++    if interval > 0 {
++        picoquic_enable_keep_alive(cnx, interval as u64 * 1000);
++    } else {
++        picoquic_disable_keep_alive(cnx);
++    }
++}
+ const RECONNECT_SLEEP_MIN_MS: u64 = 250;
+ const RECONNECT_SLEEP_MAX_MS: u64 = 5_000;
+ const FLOW_BLOCKED_LOG_INTERVAL_US: u64 = 1_000_000;
+@@ -211,12 +235,9 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
+         unsafe {
+             picoquic_set_callback(cnx, Some(client_callback), state_ptr as *mut _);
+             picoquic_enable_path_callbacks(cnx, 1);
+-            if config.keep_alive_interval > 0 {
+-                picoquic_enable_keep_alive(cnx, config.keep_alive_interval as u64 * 1000);
+-            } else {
+-                picoquic_disable_keep_alive(cnx);
+-            }
++            set_keep_alive(cnx, config.idle_keep_alive_interval);
+         }
++        let mut active_streams = false;
+ 
+         if config.gso {
+             warn!("GSO is not implemented in the Rust client loop yet.");
+@@ -267,6 +288,20 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
+                 unsafe { picoquic_get_next_wake_delay(quic, current_time, DNS_WAKE_DELAY_MAX_US) };
+             let delay_us = if delay_us < 0 { 0 } else { delay_us as u64 };
+             let streams_len_for_sleep = unsafe { (*state_ptr).streams_len() };
++            let has_active_streams = streams_len_for_sleep > 0;
++            if has_active_streams != active_streams {
++                unsafe {
++                    set_keep_alive(
++                        cnx,
++                        keep_alive_interval(
++                            streams_len_for_sleep,
++                            config.keep_alive_interval,
++                            config.idle_keep_alive_interval,
++                        ),
++                    );
++                }
++                active_streams = has_active_streams;
++            }
+             let mut has_work = streams_len_for_sleep > 0;
+             for resolver in resolvers.iter_mut() {
+                 if !refresh_resolver_path(cnx, resolver) {
+@@ -274,18 +309,22 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
+                 }
+                 let pending_for_sleep = match resolver.mode {
+                     ResolverMode::Authoritative => {
+-                        let quality = fetch_path_quality(cnx, resolver);
+-                        let snapshot = resolver
+-                            .pacing_budget
+-                            .as_mut()
+-                            .map(|budget| budget.target_inflight(&quality, delay_us.max(1)));
+-                        resolver.last_pacing_snapshot = snapshot;
+-                        let target = snapshot
+-                            .map(|snapshot| snapshot.target_inflight)
+-                            .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
+-                        let inflight_packets =
+-                            inflight_packet_estimate(quality.bytes_in_transit, mtu);
+-                        target.saturating_sub(inflight_packets)
++                        if streams_len_for_sleep == 0 {
++                            0
++                        } else {
++                            let quality = fetch_path_quality(cnx, resolver);
++                            let snapshot = resolver
++                                .pacing_budget
++                                .as_mut()
++                                .map(|budget| budget.target_inflight(&quality, delay_us.max(1)));
++                            resolver.last_pacing_snapshot = snapshot;
++                            let target = snapshot
++                                .map(|snapshot| snapshot.target_inflight)
++                                .unwrap_or_else(|| cwnd_target_polls(quality.cwin, mtu));
++                            let inflight_packets =
++                                inflight_packet_estimate(quality.bytes_in_transit, mtu);
++                            target.saturating_sub(inflight_packets)
++                        }
+                     }
+                     ResolverMode::Recursive => resolver.pending_polls,
+                 };
+@@ -487,7 +526,11 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
+                         let inflight_packets =
+                             inflight_packet_estimate(quality.bytes_in_transit, mtu);
+                         let mut poll_deficit = pacing_target.saturating_sub(inflight_packets);
+-                        if has_ready_stream && !flow_blocked {
++                        if !authoritative_polling_needed(
++                            streams_len,
++                            has_ready_stream,
++                            flow_blocked,
++                        ) {
+                             poll_deficit = 0;
+                         }
+                         if poll_deficit > 0 && resolver.debug.enabled {
+@@ -621,3 +664,22 @@ pub async fn run_client(config: &ClientConfig<'_>) -> Result<i32, ClientError> {
+         reconnect_delay = (reconnect_delay * 2).min(Duration::from_millis(RECONNECT_SLEEP_MAX_MS));
+     }
+ }
++
++#[cfg(test)]
++mod adaptive_idle_tests {
++    use super::{authoritative_polling_needed, keep_alive_interval};
++
++    #[test]
++    fn selects_idle_and_active_keep_alive() {
++        assert_eq!(keep_alive_interval(0, 400, 5000), 5000);
++        assert_eq!(keep_alive_interval(1, 400, 5000), 400);
++    }
++
++    #[test]
++    fn suppresses_authoritative_polls_without_streams() {
++        assert!(!authoritative_polling_needed(0, false, true));
++        assert!(authoritative_polling_needed(1, false, false));
++        assert!(authoritative_polling_needed(1, true, true));
++        assert!(!authoritative_polling_needed(1, true, false));
++    }
++}
+diff --git a/crates/slipstream-ffi/build/picoquic.rs b/crates/slipstream-ffi/build/picoquic.rs
+--- a/crates/slipstream-ffi/build/picoquic.rs
++++ b/crates/slipstream-ffi/build/picoquic.rs
+@@ -46,6 +46,14 @@ pub(crate) fn build_picoquic(
+     }
+     if let Some(root) = &openssl_paths.root {
+         command.env("OPENSSL_ROOT_DIR", root);
++        let lib_dir = root.join("lib");
++        let crypto = lib_dir.join("libcrypto.a");
++        let ssl = lib_dir.join("libssl.a");
++        if crypto.exists() && ssl.exists() {
++            command
++                .env("OPENSSL_CRYPTO_LIBRARY", crypto)
++                .env("OPENSSL_SSL_LIBRARY", ssl);
++        }
+     }
+     let prefer_static_openssl = cfg!(feature = "openssl-static");
+     let openssl_no_vendor = env::var_os("OPENSSL_NO_VENDOR").is_some();
+diff --git a/crates/slipstream-ffi/src/lib.rs b/crates/slipstream-ffi/src/lib.rs
+--- a/crates/slipstream-ffi/src/lib.rs
++++ b/crates/slipstream-ffi/src/lib.rs
+@@ -32,6 +32,7 @@ pub struct ClientConfig<'a> {
+     pub congestion_control: Option<&'a str>,
+     pub gso: bool,
+     pub keep_alive_interval: usize,
++    pub idle_keep_alive_interval: usize,
+     pub debug_poll: bool,
+     pub debug_streams: bool,
+ }

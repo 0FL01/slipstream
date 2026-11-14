@@ -1,0 +1,2 @@
+FROM owenclave-multipath-build:bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends meson ninja-build && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,251 @@
+{
+  "summary": [
+    {
+      "case": "gg-56-screen",
+      "arms": {
+        "A": {
+          "DL_Mbit_valid_only": 4.2409,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 0.6161,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.5327,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 10.0962
+        },
+        "B": {
+          "DL_Mbit_valid_only": 4.7182,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 0.7067,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.6304,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 6.8762
+        }
+      },
+      "paired_DL_change_pct": 14.5956,
+      "valid_pairs": 2,
+      "wins": 1
+    },
+    {
+      "case": "ggy-56-screen",
+      "arms": {
+        "A": {
+          "DL_Mbit_valid_only": 4.7424,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 0.7217,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.5905,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 7.8934
+        },
+        "B": {
+          "DL_Mbit_valid_only": 4.3774,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 0.669,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.5837,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 7.2579
+        }
+      },
+      "paired_DL_change_pct": -5.3802,
+      "valid_pairs": 2,
+      "wins": 1
+    },
+    {
+      "case": "gy-56-screen",
+      "arms": {
+        "A": {
+          "DL_Mbit_valid_only": 4.5062,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 0.5231,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.5108,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 8.3219
+        },
+        "B": {
+          "DL_Mbit_valid_only": 4.0596,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 0.6032,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.5433,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 7.7407
+        }
+      },
+      "paired_DL_change_pct": -9.4414,
+      "valid_pairs": 2,
+      "wins": 0
+    },
+    {
+      "case": "scaled-112-screen",
+      "arms": {
+        "A": {
+          "DL_Mbit_valid_only": 7.8947,
+          "DL_valid": 1,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 1.285,
+          "UL512_valid": 1,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 1.0251,
+          "loadedUL512_valid": 1,
+          "loadedUL512_offered": 2,
+          "failed_windows": 1,
+          "loaded_completion_p95_s": 4.0916
+        },
+        "B": {
+          "DL_Mbit_valid_only": 6.7396,
+          "DL_valid": 1,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 1.1365,
+          "UL512_valid": 1,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.9934,
+          "loadedUL512_valid": 1,
+          "loadedUL512_offered": 2,
+          "failed_windows": 1,
+          "loaded_completion_p95_s": 4.2222
+        }
+      },
+      "paired_DL_change_pct": -14.6312,
+      "valid_pairs": 1,
+      "wins": 0
+    },
+    {
+      "case": "scaled-224-screen",
+      "arms": {
+        "A": {
+          "DL_Mbit_valid_only": null,
+          "DL_valid": 0,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": null,
+          "UL512_valid": 0,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": null,
+          "loadedUL512_valid": 0,
+          "loadedUL512_offered": 2,
+          "failed_windows": 2,
+          "loaded_completion_p95_s": null
+        },
+        "B": {
+          "DL_Mbit_valid_only": null,
+          "DL_valid": 0,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": null,
+          "UL512_valid": 0,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": null,
+          "loadedUL512_valid": 0,
+          "loadedUL512_offered": 2,
+          "failed_windows": 2,
+          "loaded_completion_p95_s": null
+        }
+      },
+      "paired_DL_change_pct": null,
+      "valid_pairs": 0,
+      "wins": 0
+    },
+    {
+      "case": "yandex-recovery-112-screen",
+      "arms": {
+        "A": {
+          "DL_Mbit_valid_only": 4.5218,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 1.0056,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.7901,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 5.8262
+        },
+        "B": {
+          "DL_Mbit_valid_only": 4.3287,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 0.8354,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 0.7908,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 5.6313
+        }
+      },
+      "paired_DL_change_pct": -3.0456,
+      "valid_pairs": 2,
+      "wins": 1
+    },
+    {
+      "case": "yandex-recovery-224-screen",
+      "arms": {
+        "A": {
+          "DL_Mbit_valid_only": 5.3982,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 1.5281,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 1.7785,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 2.3708
+        },
+        "B": {
+          "DL_Mbit_valid_only": 4.109,
+          "DL_valid": 2,
+          "DL_offered": 2,
+          "UL512_Mbit_valid_only": 1.2027,
+          "UL512_valid": 2,
+          "UL512_offered": 2,
+          "loadedUL512_Mbit_valid_only": 1.1619,
+          "loadedUL512_valid": 2,
+          "loadedUL512_offered": 2,
+          "failed_windows": 0,
+          "loaded_completion_p95_s": 3.6589
+        }
+      },
+      "paired_DL_change_pct": -23.0807,
+      "valid_pairs": 2,
+      "wins": 0
+    }
+  ],
+  "counts": {
+    "windows": 28,
+    "complete_windows": 22,
+    "failed_windows": 6,
+    "foreground_rows": 336,
+    "foreground_successes": 264,
+    "startup_failures": 6,
+    "native_peak_rss_bytes": 11141120
+  }
+}

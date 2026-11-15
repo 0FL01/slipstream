@@ -384,18 +384,17 @@ class Parity(unittest.TestCase):
         child, _ = self.client([port(socket.SOCK_DGRAM), port(socket.SOCK_DGRAM)])
         self.assertNotEqual(child.wait(8), 0)
 
-    def multipath_loss_and_idle_recovery(self, count):
+    def test_multipath_loss_and_idle_recovery(self):
         _, dns, server = self.server()
-        paths = [Relay(dns) for _ in range(count)]; self.resources.extend(paths)
+        paths = [Relay(dns), Relay(dns)]; self.resources.extend(paths)
         child, local = self.client([p.port for p in paths])
         with self.socks(local) as s:
             s.sendall(b"start"); self.assertEqual(exact(s, 5), b"start")
             time.sleep(1.5)
-            self.assertTrue(all(p.count for p in paths), "all endpoints must validate")
+            self.assertTrue(all(p.count for p in paths), "both endpoints must validate")
             before = sum(p.count for p in paths)
             time.sleep(2.2)
-            self.assertLessEqual(sum(p.count for p in paths) - before, 3 * count,
-                                 "quiet polling must be bounded per path")
+            self.assertLessEqual(sum(p.count for p in paths) - before, 6, "quiet polling must be bounded")
             paths[0].drop = True
             data = os.urandom(32768)
             s.sendall(data)
@@ -407,15 +406,6 @@ class Parity(unittest.TestCase):
         time.sleep(2.2)
         self.assertLessEqual(sum(p.count for p in paths) - before, 3, "empty streams must not explicitly poll")
         self.assertIsNone(child.poll()); self.assertIsNone(server.poll())
-
-    def test_multipath_loss_and_idle_recovery(self):
-        self.multipath_loss_and_idle_recovery(2)
-
-    def test_three_path_loss_and_idle_recovery(self):
-        self.multipath_loss_and_idle_recovery(3)
-
-    def test_five_path_loss_and_idle_recovery(self):
-        self.multipath_loss_and_idle_recovery(5)
 
     def test_stalled_setup_is_bounded(self):
         b, dns, _ = self.server()

@@ -228,6 +228,18 @@ satisfied.
   (normal APK, PID25096) during this investigation; non-debuggable builds cannot be attached. Later runs,
   including heavy combined load, passed. R5 still needs the frozen 30-minute video session and long browse;
   do not claim universal elimination of browsing timeouts. R1 seven-day crash-free observation continues.
+- Full Ookla Speedtest through the delivered production APK/DIRECT: the web client served to this device
+  runs only `latency`+`download` (its own test POST has `stagesList:["latency","download","save"]` and it
+  sends no `/upload.php` requests), so the missing upload there is not a tunnel defect. Direct RECON:
+  firmware Web UI GETs and POSTs to the same Ookla endpoints complete; 2 MiB uploads to four selected
+  servers returned200 at ~110-126 kB/s, and 3-6 parallel 512 KiB uploads completed.
+  The Speedtest Android app (user-requested APK) completed three full tests; the two after adding it to the
+  per-app proxy allowlist traversed n-de1 (backend connection count rose to 24-25): Download/Upload
+  7.32/0.92 Mbps and 5.99/0.67 Mbps, idle ping 149-163 ms, jitter 9-22, DE servers. No tunnel code change
+  was justified by Speedtest; the earlier web-UI omission is external. Test IDs 12015551716 and latest
+  in app history.
+- Per-app proxy now allowlists Speedtest and re-enables Termux (Termux had been excluded after an earlier
+  edit); Firefox/Brave/Speedtest UIDs are tracked on the VPN network. Keep this list intact.
 - Closes: server MAX_STREAMS/stateless reply defects and the reproduced client data-callback spin.
 - Next: observe the seven-day R1 window and run the 30-minute R5 session on the delivered APK.
   Keep MTU900/DIRECT/resolvers unchanged.

@@ -11,6 +11,7 @@ def git(target, patch, *args):
 for dependency, name in (
     ("subprojects/picoquic", "picoquic-path-identity.patch"),
     ("subprojects/picoquic", "picoquic-app-credit.patch"),
+    ("subprojects/picoquic", "picoquic-reset-credit.patch"),
     ("extern/SPCDNS", "spcdns-malformed-query.patch"),
 ):
     target = root.parent / dependency

@@ -8,6 +8,10 @@
 #include <picoquic_config.h>
 #include <arpa/inet.h>
 
+const uint8_t *picoquic_decode_stream_reset_frame(picoquic_cnx_t *, const uint8_t *, const uint8_t *);
+uint8_t *picoquic_format_stream_reset_frame(picoquic_cnx_t *, picoquic_stream_head_t *,
+    uint8_t *, uint8_t *, int *, int *);
+
 static void credentials(void) {
     ss_credentials c;
     uint8_t input[81]; memset(input, 'a', sizeof(input));
@@ -144,4 +148,31 @@ static void partial_output(void) {
     close(fds[1]); free(data); free(received); picoquic_free(quic);
 }
 
-int main(void) { credentials(); framing(); scheduler(); receive_credit(); partial_output(); return 0; }
+static void reset_stream_credit(void) {
+    uint64_t now = picoquic_current_time();
+    picoquic_quic_config_t config; picoquic_config_init(&config);
+    config.nb_connections = 1; config.alpn = "test"; config.enable_sslkeylog = 0;
+    picoquic_quic_t *quic = picoquic_create_and_configure(&config, NULL, NULL, now, NULL);
+    assert(quic);
+    struct sockaddr_in addr = {0}; addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(53);
+    picoquic_cnx_t *cnx = picoquic_create_cnx(quic, picoquic_null_connection_id,
+        picoquic_null_connection_id, (struct sockaddr *)&addr, now, 0, "test", "test", 0);
+    assert(cnx);
+    uint64_t before = cnx->max_stream_id_bidir_local_computed;
+    /* Client stream 0 is cancelled before its final 1024 bytes arrive. */
+    const uint8_t reset[] = {4, 0, 0, 0x44, 0};
+    assert(picoquic_decode_stream_reset_frame(cnx, reset, reset + sizeof(reset)) == reset + sizeof(reset));
+    assert(picoquic_reset_stream(cnx, 0, 0) == 0);
+    picoquic_stream_head_t *stream = picoquic_find_stream(cnx, 0);
+    assert(stream);
+    uint8_t reply[64]; int more = 0, pure_ack = 1;
+    assert(picoquic_format_stream_reset_frame(cnx, stream, reply, reply + sizeof(reply), &more, &pure_ack) > reply);
+    assert(cnx->max_stream_id_bidir_local_computed == before + 4);
+    /* Retransmission of the peer reset must not grant a second stream credit. */
+    assert(picoquic_decode_stream_reset_frame(cnx, reset, reset + sizeof(reset)) == reset + sizeof(reset));
+    assert(cnx->max_stream_id_bidir_local_computed == before + 4);
+    picoquic_free(quic);
+}
+
+int main(void) { credentials(); framing(); scheduler(); receive_credit(); partial_output(); reset_stream_credit(); return 0; }

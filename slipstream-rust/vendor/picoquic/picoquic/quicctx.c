@@ -3471,7 +3471,10 @@ int picoquic_stream_data_consumed(picoquic_cnx_t* cnx, uint64_t stream_id, uint6
         cnx->max_stream_data_needed = 1;
     }
 
-    if (stream->fin_signalled) {
+    /* Deletion is unsafe from inside the data callback that delivered the
+     * bytes: the decoder still walks this stream and its data tree afterwards.
+     * picoquic_stream_network_input performs the close check once it returns. */
+    if (stream->fin_signalled && !cnx->in_stream_data_callback) {
         picoquic_delete_stream_if_closed(cnx, stream);
     }
 

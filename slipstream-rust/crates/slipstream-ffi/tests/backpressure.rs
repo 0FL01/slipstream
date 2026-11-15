@@ -5,7 +5,8 @@ use std::ptr;
 use slipstream_core::tcp::stream_write_buffer_bytes;
 use slipstream_ffi::picoquic::{
     picoquic_create, picoquic_current_time, slipstream_test_get_defer_stream_data_consumption,
-    slipstream_test_get_max_data_limit, slipstream_test_reset_consumption,
+    slipstream_test_consumed_inside_callback, slipstream_test_get_max_data_limit,
+    slipstream_test_reset_consumption,
 };
 use slipstream_ffi::{configure_quic, QuicGuard};
 
@@ -89,5 +90,11 @@ fn configures_connection_level_backpressure() {
         unsafe { slipstream_test_reset_consumption(quic) },
         0,
         "RESET_STREAM must release abandoned connection credit exactly once"
+    );
+    // SAFETY: the helper owns its connection within this valid QUIC context.
+    assert_eq!(
+        unsafe { slipstream_test_consumed_inside_callback(quic) },
+        0,
+        "stream must survive consumption until the data callback returns"
     );
 }

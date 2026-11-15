@@ -1078,9 +1078,12 @@ static void picoquic_stream_data_chunk_callback(picoquic_cnx_t* cnx, picoquic_st
         call_back_needed = 1;
     }
 
-    if (call_back_needed && !stream->stop_sending_requested && !stream->is_discarded &&
+    cnx->in_stream_data_callback = 1;
+    int callback_error = call_back_needed && !stream->stop_sending_requested && !stream->is_discarded &&
         cnx->callback_fn(cnx, stream->stream_id, (uint8_t *)bytes, data_length, fin_now,
-        cnx->callback_ctx, stream->app_stream_ctx) != 0) {
+        cnx->callback_ctx, stream->app_stream_ctx) != 0;
+    cnx->in_stream_data_callback = 0;
+    if (callback_error) {
         picoquic_log_app_message(cnx, "Data callback (%d, l=%zu) on stream %" PRIu64 " returns error 0x%x",
             fin_now, data_length, stream->stream_id, PICOQUIC_TRANSPORT_INTERNAL_ERROR);
         picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0);

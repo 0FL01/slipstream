@@ -202,9 +202,35 @@ satisfied.
   Harness/logs `dns-rust-c-cancel-20261115.py`, `dns-rust-c-cancel-dcubic-20261115.log`.
   Debug APK installed separately for native trace, production data untouched. Standalone Android native
   cancellation/recovery isolation is current experiment; restore production VPN when finished.
-- Closes: server MAX_STREAMS and stateless reply defects; R5 remains unresolved due reproduced client spin.
-- Next: capture the client spin under debuggable UID and fix its owner, then repeat the same phone test.
-  Keep MTU900/DIRECT/resolvers unchanged. Seven-day crash observation and30min video gate remain open.
+- Client spin root cause captured with Android lldb on a debuggable build under the same native ELF:
+  main thread looped in `picosplay` splay while inserting a stream data node whose parent/left pointed to
+  itself; the inserted node was the packet's `received_data`, already queued in that stream's data tree.
+  App consumption from inside the QUIC data callback (`picoquic_stream_data_consumed`) could delete the
+  stream and empty/recycle its data tree, after which `picoquic_stream_data_callback` deleted the same node
+  again. The pool then returned one node twice, giving the self-referential splay node and 100% CPU.
+  Fix in Rust vendor picoquic: connection bit `in_stream_data_callback`, set around the data callback;
+  `picoquic_stream_data_consumed` skips stream deletion while set; the existing close check after the
+  callback deletes it safely. Regression added to `tests/backpressure.rs` with a new C helper: consuming
+  the final bytes inside the callback keeps the stream, the next call outside deletes it. Host test passed;
+  one unrelated acceptor unit test flaked under parallel container load and passed isolated.
+- Phone verification with a fresh native process (no VPN restart during a run):
+  diagnostic debuggable APK carrying the same native ELF passed cancellation120/120 and browsing246/246;
+  concurrent browsing+cancellation passed 246+120 checks with zero failures. Final non-debuggable APK
+  `1d30a8335111b89969de91f1a1497742a58a3b49532579fb603e844dc0976d4f` (ELF
+  `2210b0a3d369dcda4c63d952fdc7a2dc05cae06160344438cfef1943eeb31ec5`) installed over production,
+  fresh native PID4869, 40/40 cancellation recovery, literal-IP HTTPS200, Wikipedia rendered, DIRECT IP
+  `195.128.101.186`, warp=off. Unstripped twin with identical `.text` kept outside Git:
+  `/home/stfu/.cache/opencode-tmp/opencode/pair-symbols.so`.
+- Deployment caveat: `adb install -r` does not stop an already running VPN child. One apparent post-fix
+  production failure reused the previous pre-fix spinning process. Stop VPN/force-stop the app before
+  installing and confirm a new native PID; do not attribute such a run to the new APK.
+- Residual (not closed): one unexplained spin occurred at cancellation round11 on a fresh fixed process
+  (normal APK, PID25096) during this investigation; non-debuggable builds cannot be attached. Later runs,
+  including heavy combined load, passed. R5 still needs the frozen 30-minute video session and long browse;
+  do not claim universal elimination of browsing timeouts. R1 seven-day crash-free observation continues.
+- Closes: server MAX_STREAMS/stateless reply defects and the reproduced client data-callback spin.
+- Next: observe the seven-day R1 window and run the 30-minute R5 session on the delivered APK.
+  Keep MTU900/DIRECT/resolvers unchanged.
 - R1: coredump capture active on n-de1 since 2026-11-14 14:35 CET (drop-in
   `/etc/systemd/system/slipstream.service.d/coredump.conf`, recorded in ops `docs/n-de1.md`).
   Fresh read-only check contradicts the handover's no-core report: SIGABRT at 18:03:01 CET,
@@ -262,9 +288,11 @@ satisfied.
   debug VPN stopped. Server code/config was not changed in this client-fix iteration.
 
 ## Current State
-- Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Production retains the signed reset-credit-fixed
-  APK; phone is temporarily in standalone debug-native isolation (not accepted VPN state). Restore production
-  after diagnosis. Published workspace branch: `mobile/dns-reset-credit`
+- Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Phone runs the signed stream-delete-fixed
+  production APK on DIRECT (PID4869 at handover); debug VPN off. Delivered file
+  `/home/stfu/Torrents/apk/Owenclave-0.17.50-native-bridge-arm64-v8a.apk`, SHA256
+  `1d30a8335111b89969de91f1a1497742a58a3b49532579fb603e844dc0976d4f`.
+  Published workspace branch: `mobile/dns-reset-credit`
   in `0FL01/slipstream` (separate layout/history from the C-server main branch).
 - Lab setup (reproducible): debug APK `org.owenewans.owenclave.debug` installs beside production
   (debug signing; profile `lab`, `tcp+mp://77.88.8.88:53`). Native ELF built in `rust:1.97.1-bookworm`

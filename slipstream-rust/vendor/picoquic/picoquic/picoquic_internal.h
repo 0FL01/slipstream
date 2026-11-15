@@ -1326,6 +1326,10 @@ typedef struct st_picoquic_cnx_t {
     /* Requesting polls */
     unsigned int is_poll_requested : 1; /* Whether the application requested to poll */
 
+    /* Application data callback reentrancy: deleting the stream from inside
+     * its own callback frees state the decoder still iterates over. */
+    unsigned int in_stream_data_callback : 1;
+
     /* Disable ack delay */
     unsigned int no_ack_delay : 1; /* Whether the ack delay is disabled, no impact on transport parameters */
 

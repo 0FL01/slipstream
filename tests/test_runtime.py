@@ -255,6 +255,28 @@ class Parity(unittest.TestCase):
         self.assertFalse(b.errors)
         self.assertIsNone(server.poll())
 
+    def test_server_restart_returns_stateless_reset(self):
+        seed = pathlib.Path(self.tmp.name) / "restart-reset-seed"
+        seed.write_text(os.urandom(16).hex())
+        _, dns, server = self.server(extra=("--reset-seed", seed))
+        child, local = self.client([dns])
+        with self.socks(local) as s:
+            s.sendall(b"before")
+            self.assertEqual(exact(s, 6), b"before")
+            server.terminate(); server.wait(3)
+            replacement = self.spawn("slipstream-server", server.args[1:])
+            time.sleep(.15)
+            self.assertIsNone(replacement.poll())
+            s.sendall(b"after")
+            # A valid reset must reach the old connection through its DNS reply;
+            # otherwise the carrier stays falsely alive until its idle timeout.
+            child.wait(5)
+        fresh, local = self.client([dns])
+        with self.socks(local) as s:
+            s.sendall(b"recovered")
+            self.assertEqual(exact(s, 9), b"recovered")
+        self.assertIsNone(fresh.poll())
+
     def test_server_explicit_bind_and_read_only_reset_seed(self):
         seed = pathlib.Path(self.tmp.name) / "reset-seed"
         for contents in (b"0123456789abcdef" * 2 + b"\n",

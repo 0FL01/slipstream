@@ -170,6 +170,39 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             if (ret < 0) {
                 return ret;
             }
+            if (!param->is_client) {
+                /* Drain immediately, before processing another DNS query: queued
+                 * stateless replies belong to this incoming datagram, not the
+                 * next slot (all QUIC peer addresses are replaced by a dummy). */
+                picoquic_stateless_packet_t* sp;
+                int replied = 0;
+                while ((sp = picoquic_dequeue_stateless_packet(quic)) != NULL) {
+                    if (last_cnx == NULL && !replied &&
+                        (!slot->max_quic || sp->length <= slot->max_quic)) {
+                        unsigned char* encoded = NULL;
+                        size_t segment_len = sp->length;
+                        ssize_t encoded_len = param->encode(slot, loop_callback_ctx, &encoded,
+                            sp->bytes, sp->length, &segment_len, &peer_addr, &local_addr);
+                        if (encoded_len > 0) {
+                            int sock_err = 0;
+                            int sent = picoquic_sendmsg(s_ctx->fd,
+                                (struct sockaddr*)&peer_addr, (struct sockaddr*)&local_addr,
+                                param->dest_if, (const char*)encoded, (int)encoded_len, 0, &sock_err);
+                            free(encoded);
+                            picoquic_delete_stateless_packet(sp);
+                            if (sent <= 0) return -1;
+                            replied = 1;
+                            continue;
+                        }
+                        free(encoded);
+                    }
+                    picoquic_delete_stateless_packet(sp);
+                }
+                if (replied) {
+                    nb_slots_written--;
+                    continue;
+                }
+            }
             if (last_cnx == NULL) {
                 DBG_PRINTF("last_cnx null in recv", NULL);
                 continue;

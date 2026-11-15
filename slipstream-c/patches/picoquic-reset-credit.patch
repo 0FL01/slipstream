@@ -1,0 +1,9 @@
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 8c8f88f..09dcde9 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -300,0 +301,4 @@ const uint8_t* picoquic_decode_stream_reset_frame(picoquic_cnx_t* cnx, const uin
++        /* A reset discards even data not yet received in order. Account it before
++         * closing the stream, or its MAX_STREAMS credit is permanently lost. */
++        stream->consumed_offset = stream->fin_offset;
++

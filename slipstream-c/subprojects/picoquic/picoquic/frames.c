@@ -298,6 +298,10 @@ const uint8_t* picoquic_decode_stream_reset_frame(picoquic_cnx_t* cnx, const uin
         stream->reset_received = 1;
         stream->remote_error  = error_code_64;
 
+        /* A reset discards even data not yet received in order. Account it before
+         * closing the stream, or its MAX_STREAMS credit is permanently lost. */
+        stream->consumed_offset = stream->fin_offset;
+
         picoquic_update_max_stream_ID_local(cnx, stream);
 
         if (cnx->callback_fn != NULL && !stream->reset_signalled) {

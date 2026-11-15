@@ -9,7 +9,7 @@ def check(patch):
     return subprocess.run(["patch", "--dry-run", "--batch", "--reverse", "-p1", "-i", str(patch)], cwd=target,
                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-for name in ("picoquic-path-identity.patch", "picoquic-app-credit.patch"):
+for name in ("picoquic-path-identity.patch", "picoquic-app-credit.patch", "picoquic-reset-credit.patch"):
     patch = root / name
     if check(patch).returncode == 0:
         continue

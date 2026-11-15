@@ -2,7 +2,7 @@
 
 Status: active
 Source: user instruction 2026-11-14 (RECON plan accepted: "делай копию плана в цель и начинай итеративную реализацию"); resolver scope restricted the same day.
-Last updated: 2026-11-14
+Last updated: 2026-11-15
 
 ## Objective
 A stable DNS-tunnel channel usable for video, music and browsing on the lab LTE phone: the authoritative
@@ -160,9 +160,51 @@ satisfied.
 - Budget: none stated.
 
 ## Current Checkpoint
-- Closes: reproduced R5 cancellation-induced starvation; R1 observation remains open.
-- Next: observe seven crash-free days from 2026-11-14 19:02:22 UTC, then request drop-in removal/restart.
-  Deployment retained default MTU 900; Yandex 900→1200 A/B is a subsequent approved experiment.
+- 2026-11-15: user reports further intermittent timeouts while browsing different domains on fixed APK.
+  Preserved active phone session (native PID10231), both server services NRestarts0. Initial literal-IP
+  HTTPS passed. Eight-domain load (Cloudflare, Google, Wikipedia, Yandex, GitHub, MDN, Mozilla, Rust):
+  192 pages + four4MiB downloads all passed, HTTP200/204. Evidence/harness:
+  `/home/stfu/.cache/opencode-tmp/opencode/dns-multidomain-before-20261115.jsonl` and
+  `dns-multidomain-20261115.py`. Firefox showed a prior Speedtest connection-reset error; explicit fresh
+  navigation subsequently loaded it without VPN restart. Do not attribute that isolated error yet.
+  Aggregate backend connections varied about40→10; sampled server FDs stayed below the64-live-stream
+  cap, so no admission-limit increase is justified by this observation.
+- Separate server defect confirmed with a valid peer RESET_STREAM final-size gap: when the C server
+  resets its own sending direction, max_stream_id_bidir_local_computed fails to advance, permanently
+  losing one stream credit. Existing `tests/test_protocol.c` regression fails before fix and passes with
+  reset consumption advanced to final offset before closure accounting; duplicate reset grants no extra
+  credit. This is C-server MAX_STREAMS, distinct from yesterday's Android MAX_DATA fix. First full suite:
+  6/7 groups passed; three-/five-path timing assertions failed during concurrent compilation, both passed
+  isolated unchanged. Published C-main374b964; Debian SHA3d179bd5fa62b028473f51e175d4b29491f4324ecc803cf114541cfcb0888fef
+  deployed2026-11-15 07:42:45UTC with backup `/root/backups/slipstream-reset-credit-20261115T074220Z/`.
+  Only Slipstream restarted; unit/drop-in hashes and FlowRelay/WARP PIDs unchanged.
+- Deployment exposed another reachable failure: the unchanged phone session failed six literal-IP HTTPS
+  attempts after server restart; RA74 reverse listener disappeared too. C sockloop never drained picoquic's
+  stateless reply queue, leaving old sessions without the reset notification. New loopback runtime test
+  `Parity.test_server_restart_returns_stateless_reset` with persistent reset seed times out before fix,
+  passes in~1s after causal per-request stateless DNS replies are sent; fresh payload connection passes.
+  Queue is drained immediately for each incoming datagram so responses cannot be assigned to another
+  DNS slot. Full ASan/UBSan suite7/7 passed (runtime54.78s). C-main `e513568` deployed07:52:58UTC,
+  SHA1beb4f66aa11df1d34e5efdc2289208269d2d863ca3175de9da483add558516a,
+  backup `/root/backups/slipstream-stateless-20261115T075236Z/`. RA74 reverse listener recovered,
+  but phone session that spent~10min without replies before this deployment did not. Manual VPN restart
+  restored it (new native PID15343). Synthetic two-path Rust/C restart passed~0.27s, and native TCP-DNS
+  Rust/C bridge restart~1.45s; external harness/logs `dns-rust-c-restart-20261115.py`,
+  `dns-rust-c-restart-20261115.log`, `dns-rust-tcp-c-restart-20261115.log` in the external cache.
+- Subsequent phone cancellation test STILL FAILED with both server fixes: 54 successful recovery pages,
+  then rounds54–56 connection timeouts8s; no concurrent server restart. Evidence
+  `dns-cancel-serverfix-20261115.jsonl`. Native PID15343 remained alive at100% one-core CPU; its two
+  dns-tcp-bridge threads slept. Server remained active/NRestarts0, only RA74 backend connection present,
+  server-direct Wikipedia200/0.298s. This is client-side spinning, not proof of slow egress or 64-stream cap.
+  Android native stack capture unavailable on production (`debuggerd: root is required`).
+  Local Rust/C cancellation simulations (two native TCP-DNS bridges): 180 rounds passed with BBR/short
+  reads; 180 rounds also passed with CUBIC,224lanes/depth1,0.8s cancellation,70ms per-exchange delay.
+  Harness/logs `dns-rust-c-cancel-20261115.py`, `dns-rust-c-cancel-dcubic-20261115.log`.
+  Debug APK installed separately for native trace, production data untouched. Standalone Android native
+  cancellation/recovery isolation is current experiment; restore production VPN when finished.
+- Closes: server MAX_STREAMS and stateless reply defects; R5 remains unresolved due reproduced client spin.
+- Next: capture the client spin under debuggable UID and fix its owner, then repeat the same phone test.
+  Keep MTU900/DIRECT/resolvers unchanged. Seven-day crash observation and30min video gate remain open.
 - R1: coredump capture active on n-de1 since 2026-11-14 14:35 CET (drop-in
   `/etc/systemd/system/slipstream.service.d/coredump.conf`, recorded in ops `docs/n-de1.md`).
   Fresh read-only check contradicts the handover's no-core report: SIGABRT at 18:03:01 CET,
@@ -220,8 +262,9 @@ satisfied.
   debug VPN stopped. Server code/config was not changed in this client-fix iteration.
 
 ## Current State
-- Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Phone runs the signed reset-credit-fixed
-  production APK on DIRECT; debug VPN stopped. Published workspace branch: `mobile/dns-reset-credit`
+- Resolved: R2, R3, R4. R1 and R5 in progress (see evidence). Production retains the signed reset-credit-fixed
+  APK; phone is temporarily in standalone debug-native isolation (not accepted VPN state). Restore production
+  after diagnosis. Published workspace branch: `mobile/dns-reset-credit`
   in `0FL01/slipstream` (separate layout/history from the C-server main branch).
 - Lab setup (reproducible): debug APK `org.owenewans.owenclave.debug` installs beside production
   (debug signing; profile `lab`, `tcp+mp://77.88.8.88:53`). Native ELF built in `rust:1.97.1-bookworm`

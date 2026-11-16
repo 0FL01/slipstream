@@ -34,6 +34,7 @@ pub struct ClientConfig<'a> {
     pub keep_alive_interval: usize,
     pub idle_keep_alive_interval: usize,
     pub dns_key: Option<[u8; 32]>,
+    pub dpi_stats: bool,
     pub debug_poll: bool,
     pub debug_streams: bool,
 }

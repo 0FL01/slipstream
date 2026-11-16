@@ -1,6 +1,6 @@
 use std::fmt;
 
-const ENCODE_TABLE: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const ENCODE_TABLE: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Base32Error {

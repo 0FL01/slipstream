@@ -9,7 +9,7 @@ use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
-    sockaddr_storage_to_socket_addr, DnsCipher, DnsResponseContext,
+    sockaddr_storage_to_socket_addr, DnsCipher, DnsId, DnsResponseContext, DpiStats,
 };
 use crate::error::ClientError;
 use crate::flow_relay::FlowRelayConfig;
@@ -20,7 +20,7 @@ use crate::streams::{
     ClientState, Command,
 };
 use slipstream_core::{net::is_transient_udp_error, normalize_dual_stack_addr};
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use slipstream_dns::{build_qname_variable, encode_query, QueryParams, CLASS_IN, RR_TXT};
 use slipstream_ffi::{
     configure_quic_with_custom,
     picoquic::{
@@ -266,6 +266,7 @@ pub async fn run_client(
 ) -> Result<i32, ClientError> {
     let domain_len = config.domain.len();
     let mut cipher = DnsCipher::new(config.dns_key);
+    let mut stats = DpiStats::new(config.dpi_stats, config.domain);
     let mtu = compute_mtu(domain_len)?.saturating_sub(cipher.overhead() as u32);
     let udp = bind_udp_socket().await?;
 
@@ -424,7 +425,7 @@ pub async fn run_client(
             warn!("GSO is not implemented in the Rust client loop yet.");
         }
 
-        let mut dns_id = 1u16;
+        let mut dns_id = DnsId::new();
         let mut recv_buf = vec![0u8; 4096];
         let mut send_buf = vec![0u8; PICOQUIC_MAX_PACKET_SIZE];
         let packet_loop_send_max = loop_burst_total(&resolvers, PICOQUIC_PACKET_LOOP_SEND_MAX);
@@ -435,6 +436,7 @@ pub async fn run_client(
 
         loop {
             let current_time = unsafe { picoquic_current_time() };
+            stats.maybe_report(current_time);
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
             let closing = unsafe { (*state_ptr).is_closing() };
@@ -566,6 +568,7 @@ pub async fn run_client(
                                 local_addr_storage: &local_addr_storage,
                                 resolvers: &mut resolvers,
                                 cipher: &cipher,
+                                stats: &mut stats,
                             };
                             handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
                             for _ in 1..packet_loop_recv_max {
@@ -659,10 +662,12 @@ pub async fn run_client(
                 }
 
                 let encrypted = cipher.encrypt_query(&send_buf[..send_length]);
-                let qname = build_qname(&encrypted, config.domain)
+                let qname = build_qname_variable(&encrypted, config.domain)
                     .map_err(|err| ClientError::new(err.to_string()))?;
+                let query_id = dns_id.next();
+                stats.record_query(&qname, query_id, RR_TXT, current_time);
                 let params = QueryParams {
-                    id: dns_id,
+                    id: query_id,
                     qname: &qname,
                     qtype: RR_TXT,
                     qclass: CLASS_IN,
@@ -671,7 +676,6 @@ pub async fn run_client(
                     qdcount: 1,
                     is_query: true,
                 };
-                dns_id = dns_id.wrapping_add(1);
                 let packet =
                     encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?;
 
@@ -774,6 +778,7 @@ pub async fn run_client(
                                 &mut to_send,
                                 &mut send_buf,
                                 &mut cipher,
+                                &mut stats,
                             )
                             .await?;
                             if scheduler.poll_interval_us > 0 {
@@ -797,6 +802,7 @@ pub async fn run_client(
                                     &mut to_send,
                                     &mut send_buf,
                                     &mut cipher,
+                                    &mut stats,
                                 )
                                 .await?;
                                 resolver.pending_polls = resolver
@@ -815,6 +821,7 @@ pub async fn run_client(
                                     &mut pending,
                                     &mut send_buf,
                                     &mut cipher,
+                                    &mut stats,
                                 )
                                 .await?;
                                 resolver.pending_polls = pending;

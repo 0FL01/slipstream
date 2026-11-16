@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use super::cipher::DnsCipher;
 use super::resolver::ResolverState;
+use super::stats::DpiStats;
 use slipstream_core::normalize_dual_stack_addr;
 
 const MAX_POLL_BURST: usize = PICOQUIC_PACKET_LOOP_RECV_MAX;
@@ -18,6 +19,7 @@ pub(crate) struct DnsResponseContext<'a> {
     pub(crate) local_addr_storage: &'a libc::sockaddr_storage,
     pub(crate) resolvers: &'a mut [ResolverState],
     pub(crate) cipher: &'a DnsCipher,
+    pub(crate) stats: &'a mut DpiStats,
 }
 
 pub(crate) fn handle_dns_response(
@@ -27,7 +29,9 @@ pub(crate) fn handle_dns_response(
 ) -> Result<(), ClientError> {
     let peer = normalize_dual_stack_addr(peer);
     let response_id = dns_response_id(buf);
-    if let Some(payload) = decode_response(buf) {
+    let payload = decode_response(buf);
+    ctx.stats.record_response(buf.len(), payload.as_deref());
+    if let Some(payload) = payload {
         // Wrong-key or corrupted replies are ignored exactly like unrelated DNS
         // traffic; they must not feed QUIC.
         let Some(payload) = ctx.cipher.decrypt_response(&payload) else {

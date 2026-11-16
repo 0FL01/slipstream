@@ -73,6 +73,8 @@ struct Args {
     idle_keep_alive_interval: u16,
     #[arg(long = "flow-relay-stdin")]
     flow_relay_stdin: bool,
+    #[arg(long = "dpi-stats")]
+    dpi_stats: bool,
     #[arg(long = "debug-poll")]
     debug_poll: bool,
     #[arg(long = "debug-streams")]
@@ -225,6 +227,7 @@ fn main() {
         keep_alive_interval: keep_alive_interval as usize,
         idle_keep_alive_interval: args.idle_keep_alive_interval as usize,
         dns_key,
+        dpi_stats: args.dpi_stats,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
     };

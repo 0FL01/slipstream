@@ -37,6 +37,10 @@ import kotlin.coroutines.suspendCoroutine
 
 interface LocalResolver : LocalResolver {
 
+    companion object {
+        private val dnsShapeMetrics = DnsShapeMetrics()
+    }
+
     var underlyingNetwork: Network?
 
     private val instance: DnsResolver?
@@ -54,6 +58,7 @@ interface LocalResolver : LocalResolver {
     }
 
     override fun lookupIP(network: String, domain: String): String {
+        dnsShapeMetrics.recordLookup(domain, network)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             return runBlocking {
                 suspendCoroutine { continuation ->
@@ -131,6 +136,7 @@ interface LocalResolver : LocalResolver {
 
     @RequiresApi(Build.VERSION_CODES.Q)
     override fun exchange(message: ByteArray): ByteArray {
+        dnsShapeMetrics.record(message)
         return runBlocking {
             suspendCoroutine { continuation ->
                 val signal = CancellationSignal()

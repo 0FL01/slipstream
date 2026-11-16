@@ -203,7 +203,10 @@ internal class SlipstreamInstance(
         scope.launch {
             runCatching {
                 stream.bufferedReader().useLines { lines ->
-                    lines.forEach { if (it.contains("Connection ready")) ready.complete(Unit) }
+                    lines.forEach {
+                        if (it.contains("Connection ready")) ready.complete(Unit)
+                        if (it.contains("dpi-stats:")) Logs.i("slipstream: $it")
+                    }
                 }
             }
         }
@@ -250,6 +253,7 @@ internal class SlipstreamInstance(
             "--domain", config.domain,
             "--cert", certificate.absolutePath,
             "--congestion-control", "dcubic",
+            "--dpi-stats",
             "--flow-relay-stdin",
         ) + authorities
         val child = ProcessBuilder(command)

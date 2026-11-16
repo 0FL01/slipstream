@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use slipstream_core::net::is_transient_udp_error;
-use slipstream_dns::{build_qname, encode_query, QueryParams, CLASS_IN, RR_TXT};
+use slipstream_dns::{build_qname_variable, encode_query, QueryParams, CLASS_IN, RR_TXT};
 use slipstream_ffi::picoquic::{
     picoquic_cnx_t, picoquic_current_time, picoquic_prepare_packet_ex, slipstream_request_poll,
 };
@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
 use super::cipher::DnsCipher;
+use super::id::DnsId;
 use super::path::refresh_resolver_path;
 use super::resolver::{sockaddr_storage_to_socket_addr, ResolverState};
+use super::stats::DpiStats;
 use slipstream_core::normalize_dual_stack_addr;
 
 const AUTHORITATIVE_POLL_TIMEOUT_US: u64 = 5_000_000;
@@ -37,11 +39,12 @@ pub(crate) async fn send_poll_queries(
     udp: &TokioUdpSocket,
     config: &ClientConfig<'_>,
     local_addr_storage: &mut libc::sockaddr_storage,
-    dns_id: &mut u16,
+    dns_id: &mut DnsId,
     resolver: &mut ResolverState,
     remaining: &mut usize,
     send_buf: &mut [u8],
     cipher: &mut DnsCipher,
+    stats: &mut DpiStats,
 ) -> Result<(), ClientError> {
     if !refresh_resolver_path(cnx, resolver) {
         return Ok(());
@@ -88,10 +91,11 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.send_bytes = resolver.debug.send_bytes.saturating_add(send_length as u64);
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
-        let poll_id = *dns_id;
+        let poll_id = dns_id.next();
         let encrypted = cipher.encrypt_query(&send_buf[..send_length]);
-        let qname = build_qname(&encrypted, config.domain)
+        let qname = build_qname_variable(&encrypted, config.domain)
             .map_err(|err| ClientError::new(err.to_string()))?;
+        stats.record_query(&qname, poll_id, RR_TXT, current_time);
         let params = QueryParams {
             id: poll_id,
             qname: &qname,
@@ -102,7 +106,6 @@ pub(crate) async fn send_poll_queries(
             qdcount: 1,
             is_query: true,
         };
-        *dns_id = dns_id.wrapping_add(1);
         let packet = encode_query(&params).map_err(|err| ClientError::new(err.to_string()))?;
 
         let dest = sockaddr_storage_to_socket_addr(&addr_to)?;

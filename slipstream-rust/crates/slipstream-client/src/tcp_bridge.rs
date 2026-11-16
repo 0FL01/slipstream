@@ -30,6 +30,14 @@ const MAX_DNS_MESSAGE: usize = 4096;
 const LANE_MIN: usize = 8;
 const LANE_IDLE: Duration = Duration::from_secs(30);
 
+/// Aggregate active lanes across all bridge instances, for aggregate-only DPI
+/// stats. No per-lane state is exposed.
+static ACTIVE_LANES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn active_lanes() -> usize {
+    ACTIVE_LANES.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BridgeConfig {
     pub(crate) lanes: usize,
@@ -109,10 +117,12 @@ impl LanePool {
             self.active.fetch_sub(1, Ordering::AcqRel);
             return;
         }
+        ACTIVE_LANES.fetch_add(1, Ordering::Relaxed);
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             lane(pool.clone(), persistent).await;
             pool.active.fetch_sub(1, Ordering::AcqRel);
+            ACTIVE_LANES.fetch_sub(1, Ordering::Relaxed);
             pool.ensure_capacity();
         });
     }

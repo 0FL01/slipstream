@@ -12,7 +12,7 @@ static dns_query_t *decode_answer(unsigned char *response, size_t length,
 /* Out-of-zone, apex, non-TXT and malformed-payload queries are answered
  * directly from the zone code without creating a QUIC response. */
 static void direct_reply(const char *name, dns_type_t type, dns_rcode_t expected,
-    size_t expect_ns) {
+    size_t expect_ns, size_t expect_an, dns_type_t expect_type, bool spcdns_decode) {
     slot_t slot = {0};
     dns_question_t question = {0};
     question.name = (char *)name; question.type = type; question.class = CLASS_IN;
@@ -29,11 +29,20 @@ static void direct_reply(const char *name, dns_type_t type, dns_rcode_t expected
     assert(length == 0 && decoded == NULL);
     assert(slot.direct && slot.direct_len);
 
+    if (!spcdns_decode) {
+        /* SPCDNS decode_rr_mx rejects a root exchange (null MX, RFC 7505);
+         * validate the header and answer count on the wire instead. */
+        assert((slot.direct[3] & 0x0f) == expected);
+        assert((((size_t)slot.direct[6] << 8) | slot.direct[7]) == expect_an);
+        free(slot.direct);
+        return;
+    }
     dns_decoded_t buffer[DNS_DECODEBUF_4K];
     dns_query_t *answer = decode_answer(slot.direct, slot.direct_len, buffer, &size);
     assert(!answer->query && answer->aa && answer->rd && answer->cd);
     assert(answer->id == query.id && answer->rcode == expected);
-    assert(answer->qdcount == 1 && answer->ancount == 0);
+    assert(answer->qdcount == 1 && answer->ancount == expect_an);
+    if (expect_an) assert(answer->answers[0].generic.type == expect_type);
     assert(answer->nscount == expect_ns);
     assert(answer->arcount == 0);
     assert(!strcmp(answer->questions[0].name, name));
@@ -73,7 +82,7 @@ static void tunnel_payload(const char *name) {
     assert(answer->id == query.id && answer->rcode == RCODE_OKAY);
     assert(answer->qdcount == 1 && answer->ancount == 1 && answer->nscount == 0);
     assert(answer->answers[0].txt.type == RR_TXT);
-    assert(answer->answers[0].txt.ttl >= 30 && answer->answers[0].txt.ttl <= 270);
+    assert(answer->answers[0].txt.ttl >= 30 && answer->answers[0].txt.ttl <= 302);
     /* The query had no EDNS OPT, so the reply must not invent one. */
     assert(answer->arcount == 0);
     free(response);
@@ -121,10 +130,13 @@ static void reply_fits(size_t labels_len, int edns) {
 int main(void) {
     const char *domains[] = {"t.test"};
     server_domains = domains; server_domain_count = 1;
-    direct_reply("aa.untrusted.test.", RR_TXT, RCODE_REFUSED, 0);
-    direct_reply("aa.t.test.", RR_A, RCODE_NAME_ERROR, 1);
-    direct_reply("00.t.test.", RR_TXT, RCODE_NAME_ERROR, 1);
-    direct_reply("t.test.", RR_TXT, RCODE_OKAY, 1);
+    direct_reply("aa.untrusted.test.", RR_TXT, RCODE_REFUSED, 0, 0, RR_TXT, true);
+    direct_reply("aa.t.test.", RR_A, RCODE_NAME_ERROR, 1, 0, RR_A, true);
+    direct_reply("00.t.test.", RR_TXT, RCODE_NAME_ERROR, 1, 0, RR_TXT, true);
+    direct_reply("t.test.", RR_TXT, RCODE_OKAY, 0, 1, RR_TXT, true);
+    direct_reply("t.test.", RR_MX, RCODE_OKAY, 0, 1, RR_MX, false);
+    direct_reply("_dmarc.t.test.", RR_TXT, RCODE_OKAY, 0, 1, RR_TXT, true);
+    direct_reply("_dmarc.t.test.", RR_A, RCODE_OKAY, 1, 0, RR_A, true);
     tunnel_payload("aa.t.test.");
     reply_fits(240, 1232);
     reply_fits(64, 1232);

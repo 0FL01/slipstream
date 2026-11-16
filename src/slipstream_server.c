@@ -149,10 +149,17 @@ static size_t request_edns_payload(const dns_query_t *q, bool *present, bool *fd
     return payload;
 }
 
+/* A realistic TTL set instead of a uniform 30..270 spread. */
+static TTL server_txt_ttl(void) {
+    static const TTL choices[] = {30, 60, 120, 300};
+    uint64_t now = picoquic_current_time() / 1000u;
+    return choices[(now / 7u) % 4u] + (TTL)(now % 3u);
+}
+
 /* Replies for the served zone and for names that are not tunnel payloads.
  * Keeping the zone conventional makes active probing uninteresting. */
 static ssize_t server_zone_reply(slot_t *slot, const dns_query_t *q,
-    const char *zone, bool zone_match, bool apex) {
+    const char *zone, bool zone_match, bool apex, bool dmarc) {
     dns_query_t response = {0};
     response.id = q->id;
     response.aa = true;
@@ -196,11 +203,33 @@ static ssize_t server_zone_reply(slot_t *slot, const dns_query_t *q,
     glue1.address = local4 ? local4->sin_addr.s_addr : 0;
     glue2 = glue1; glue2.name = ns2;
 
+    /* A domain that does not accept mail: null MX + SPF -all + DMARC reject. */
+    dns_mx_t null_mx = {0};
+    null_mx.name = zone_fqdn; null_mx.type = RR_MX; null_mx.class = CLASS_IN;
+    null_mx.ttl = 300; null_mx.preference = 0; null_mx.exchange = ".";
+    dns_txt_t policy_txt = {0};
+    policy_txt.name = q->questions[0].name; policy_txt.type = RR_TXT;
+    policy_txt.class = CLASS_IN; policy_txt.ttl = server_txt_ttl();
+    if (dmarc) {
+        policy_txt.text = "v=DMARC1; p=reject";
+    } else {
+        policy_txt.text = "v=spf1 -all";
+    }
+    policy_txt.len = strlen(policy_txt.text);
+
     if (!zone_match) {
         response.rcode = RCODE_REFUSED;
     } else {
         dns_type_t qtype = q->questions[0].type;
-        if (!apex) {
+        if (dmarc) {
+            if (qtype == RR_TXT) {
+                response.rcode = RCODE_OKAY;
+                answers[0].txt = policy_txt; ancount = 1;
+            } else {
+                response.rcode = RCODE_OKAY; /* name exists, no such type */
+                authority[0].soa = soa; nscount = 1;
+            }
+        } else if (!apex) {
             response.rcode = RCODE_NAME_ERROR;
             authority[0].soa = soa; nscount = 1;
         } else if (qtype == RR_SOA) {
@@ -218,6 +247,12 @@ static ssize_t server_zone_reply(slot_t *slot, const dns_query_t *q,
         } else if (qtype == RR_AAAA && local6) {
             response.rcode = RCODE_OKAY;
             answers[0].aaaa = aaaarec; ancount = 1;
+        } else if (qtype == RR_MX) {
+            response.rcode = RCODE_OKAY;
+            answers[0].mx = null_mx; ancount = 1;
+        } else if (qtype == RR_TXT) {
+            response.rcode = RCODE_OKAY;
+            answers[0].txt = policy_txt; ancount = 1;
         } else {
             response.rcode = RCODE_OKAY; /* apex exists: NODATA, not NXDOMAIN */
             authority[0].soa = soa; nscount = 1;
@@ -270,7 +305,7 @@ ssize_t server_encode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
     }
     if (length) {
         txt.name = q->questions[0].name; txt.type = RR_TXT; txt.class = CLASS_IN;
-        txt.ttl = 30 + (picoquic_current_time() / 1000u) % 241u;
+        txt.ttl = server_txt_ttl();
         txt.text = (char *)text; txt.len = text_len;
         response.ancount = 1; response.answers = (dns_answer_t *)&txt;
     }
@@ -347,9 +382,12 @@ ssize_t server_decode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
         }
     }
     bool apex = zone_match && n == zone_len;
-    if (!zone_match || apex || q->questions[0].type != RR_TXT) {
-        /* Out-of-zone, apex, or a non-tunnel query: answer like a normal zone. */
-        return server_zone_reply(slot, q, zone, zone_match, apex);
+    bool dmarc = zone_match && !apex && n == zone_len + 7 &&
+        !strncasecmp(name, "_dmarc", 6) && name[6] == '.';
+    if (dmarc || !zone_match || apex || q->questions[0].type != RR_TXT) {
+        /* Out-of-zone, apex, policy name, or a non-tunnel query: answer like a
+         * normal zone. */
+        return server_zone_reply(slot, q, zone, zone_match, apex, dmarc);
     }
 
     slot->max_quic = server_quic_cap(q, n);
@@ -357,7 +395,7 @@ ssize_t server_decode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
         slot->max_quic = slot->max_quic > DNS_CRYPTO_OVERHEAD ? slot->max_quic - DNS_CRYPTO_OVERHEAD : 1;
     size_t data_len = n - zone_len - 1;
     if (!data_len || data_len > 253)
-        return server_zone_reply(slot, q, zone, true, false);
+        return server_zone_reply(slot, q, zone, true, false, false);
     char data[256]; memcpy(data, name, data_len); data[data_len] = 0;
     size_t encoded = slipstream_inline_undotify(data, data_len);
     char *decoded = malloc(encoded);
@@ -365,13 +403,13 @@ ssize_t server_decode(void *slot_ptr, void *ctx, unsigned char **dest, const uns
     size_t decoded_len = b32_decode(decoded, data, encoded, false);
     if (decoded_len == (size_t)-1) {
         free(decoded);
-        return server_zone_reply(slot, q, zone, true, false);
+        return server_zone_reply(slot, q, zone, true, false, false);
     }
     if (dns_crypto_enabled) {
         size_t plain_len = 0;
         unsigned char *plain = dns_crypto_decrypt((unsigned char *)decoded, decoded_len, &plain_len);
         free(decoded);
-        if (!plain) return server_zone_reply(slot, q, zone, true, false);
+        if (!plain) return server_zone_reply(slot, q, zone, true, false, false);
         decoded = (char *)plain;
         decoded_len = plain_len;
     }

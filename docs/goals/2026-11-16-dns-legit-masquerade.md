@@ -52,8 +52,11 @@ satisfied.
     20..=57 characters (`dots.rs`, `lib.rs`); the C decoder accepted lowercase and variable dots in
     the local Rust<->C SOCKS transfer. Zone live: `MX 0 .`, `TXT "v=spf1 -all"`,
     `_dmarc TXT "v=DMARC1; p=reject"`, unknown names still NXDOMAIN+SOA; TXT TTL set is 30/60/120/300
-    plus 0-2 jitter. `cargo test` 30/30, C suite 7/7, Kotlin compile, signed APK; phone H3/H6 are off.
-    Server binary `1a610a3d…` deployed with backup `/root/backups/slipstream-legit-20261116T123312Z/`.
+    plus 0-2 jitter. `cargo test` 30/30, C suite 7/7, Kotlin compile, signed APK
+    `f33629d5…`; phone H3/H6 are off. Latest Speedtest through the new client:
+    DL 7.86 Mbps, UL 0.64 Mbps, ping 178/189/163 ms - no throughput loss against the
+    2026-11-15 baseline (DL 7.32/5.99, UL 0.92/0.67). Server binary `1a610a3d…` deployed
+    with backup `/root/backups/slipstream-legit-20261116T123312Z/`.
 
 ### Constraints
 - C1: Keep existing contracts: FlowRelay token auth, one QUIC stream per app flow, gVisor only,

@@ -147,11 +147,26 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             if (bytes_recv < 0) {
                 /* Malformed DNS must not terminate the listener. */
                 free(decoded);
+                free(slot->direct);
+                slot->direct = NULL;
+                nb_slots_written--;
+                continue;
+            }
+
+            if (slot->direct) {
+                int sock_err = 0;
+                (void)picoquic_sendmsg(s_ctx->fd,
+                    (struct sockaddr*)&slot->peer_addr, (struct sockaddr*)&slot->local_addr,
+                    param->dest_if, (const char*)slot->direct, (int)slot->direct_len, 0, &sock_err);
+                free(slot->direct);
+                slot->direct = NULL;
+                slot->direct_len = 0;
                 nb_slots_written--;
                 continue;
             }
 
             if (bytes_recv == 0) {
+                nb_slots_written--;
                 continue;
             }
 

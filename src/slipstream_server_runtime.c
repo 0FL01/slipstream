@@ -19,6 +19,7 @@ extern ssize_t server_encode(void*, void*, unsigned char**, const unsigned char*
     size_t*, struct sockaddr_storage*, struct sockaddr_storage*);
 extern ssize_t server_decode(void*, void*, unsigned char**, const unsigned char*, size_t,
     struct sockaddr_storage*, struct sockaddr_storage*);
+extern int server_dns_crypto_init(const char *token_file);
 
 static int server_callback(picoquic_cnx_t *cnx, uint64_t id, uint8_t *bytes, size_t length,
     picoquic_call_back_event_t event, void *ctx, void *stream) {
@@ -105,8 +106,10 @@ static int load_reset_seed(const char *path, uint8_t seed[16]) {
 
 int picoquic_slipstream_server(int port, bool ipv6, const char *cert, const char *key,
     struct sockaddr_storage *target, const char *const *domains, size_t domain_count,
-    size_t max_connections, size_t idle_timeout, const char *listen_host, const char *reset_seed_file, size_t mtu) {
+    size_t max_connections, size_t idle_timeout, const char *listen_host, const char *reset_seed_file, size_t mtu,
+    const char *token_file) {
     if (!domain_count || max_connections == 0 || max_connections > 32 || !idle_timeout || mtu < 600 || mtu > 1400) return 2;
+    if (server_dns_crypto_init(token_file)) return 2;
     struct sockaddr_in listen_address = {0};
     if (listen_host) {
         if (ipv6 || inet_pton(AF_INET, listen_host, &listen_address.sin_addr) != 1) return 2;

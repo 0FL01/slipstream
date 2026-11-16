@@ -8,6 +8,7 @@ use slipstream_ffi::{ClientConfig, ResolverMode};
 use std::collections::HashMap;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
+use super::cipher::DnsCipher;
 use super::path::refresh_resolver_path;
 use super::resolver::{sockaddr_storage_to_socket_addr, ResolverState};
 use slipstream_core::normalize_dual_stack_addr;
@@ -40,6 +41,7 @@ pub(crate) async fn send_poll_queries(
     resolver: &mut ResolverState,
     remaining: &mut usize,
     send_buf: &mut [u8],
+    cipher: &mut DnsCipher,
 ) -> Result<(), ClientError> {
     if !refresh_resolver_path(cnx, resolver) {
         return Ok(());
@@ -87,7 +89,8 @@ pub(crate) async fn send_poll_queries(
         resolver.debug.polls_sent = resolver.debug.polls_sent.saturating_add(1);
 
         let poll_id = *dns_id;
-        let qname = build_qname(&send_buf[..send_length], config.domain)
+        let encrypted = cipher.encrypt_query(&send_buf[..send_length]);
+        let qname = build_qname(&encrypted, config.domain)
             .map_err(|err| ClientError::new(err.to_string()))?;
         let params = QueryParams {
             id: poll_id,

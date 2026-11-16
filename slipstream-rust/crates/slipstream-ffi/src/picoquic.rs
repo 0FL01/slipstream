@@ -291,6 +291,7 @@ extern "C" {
 
     pub fn picoquic_enable_keep_alive(cnx: *mut picoquic_cnx_t, interval: u64);
     pub fn picoquic_disable_keep_alive(cnx: *mut picoquic_cnx_t);
+    pub fn picoquic_set_default_idle_timeout(quic: *mut picoquic_quic_t, idle_timeout_ms: u64);
 
     pub fn picoquic_get_next_wake_delay(
         quic: *mut picoquic_quic_t,

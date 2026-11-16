@@ -33,6 +33,7 @@ pub struct ClientConfig<'a> {
     pub gso: bool,
     pub keep_alive_interval: usize,
     pub idle_keep_alive_interval: usize,
+    pub dns_key: Option<[u8; 32]>,
     pub debug_poll: bool,
     pub debug_streams: bool,
 }

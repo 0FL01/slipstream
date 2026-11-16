@@ -9,6 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,10 @@ const RECONNECT_MIN: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(2);
 const MAX_ATTEMPTS: u8 = 2;
 const MAX_DNS_MESSAGE: usize = 4096;
+/// Keep this many lanes permanently connected; additional lanes exist only
+/// while the queue is deep and close again after being idle.
+const LANE_MIN: usize = 8;
+const LANE_IDLE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BridgeConfig {
@@ -89,6 +94,40 @@ impl Shared {
     }
 }
 
+struct LanePool {
+    shared: Arc<Shared>,
+    udp: Arc<UdpSocket>,
+    resolver: SocketAddr,
+    depth: usize,
+    max_lanes: usize,
+    active: AtomicUsize,
+}
+
+impl LanePool {
+    fn spawn(self: &Arc<Self>, persistent: bool) {
+        if self.active.fetch_add(1, Ordering::AcqRel) >= self.max_lanes {
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            lane(pool.clone(), persistent).await;
+            pool.active.fetch_sub(1, Ordering::AcqRel);
+            pool.ensure_capacity();
+        });
+    }
+
+    /// Add one lane when the queue exceeds the work already held by the
+    /// currently connected lanes. Repeated arrivals ramp up to `max_lanes`.
+    fn ensure_capacity(self: &Arc<Self>) {
+        let queued = self.shared.queue.lock().unwrap().len();
+        let active = self.active.load(Ordering::Acquire);
+        if queued > active.saturating_mul(self.depth) {
+            self.spawn(false);
+        }
+    }
+}
+
 /// Binds the loopback endpoint and starts the bridge thread. Returns the loopback
 /// address the QUIC runtime must use as its authoritative resolver.
 pub(crate) fn spawn(resolver: SocketAddr, config: BridgeConfig) -> io::Result<SocketAddr> {
@@ -130,8 +169,16 @@ async fn run(udp: StdUdpSocket, resolver: SocketAddr, config: BridgeConfig) -> i
         notify: Notify::new(),
         capacity: config.queue,
     });
-    for _ in 0..config.lanes {
-        tokio::spawn(lane(shared.clone(), udp.clone(), resolver, config.depth));
+    let pool = Arc::new(LanePool {
+        shared: shared.clone(),
+        udp: udp.clone(),
+        resolver,
+        depth: config.depth,
+        max_lanes: config.lanes,
+        active: AtomicUsize::new(0),
+    });
+    for _ in 0..config.lanes.min(LANE_MIN) {
+        pool.spawn(true);
     }
     let mut buf = vec![0u8; MAX_DNS_MESSAGE];
     loop {
@@ -149,6 +196,7 @@ async fn run(udp: StdUdpSocket, resolver: SocketAddr, config: BridgeConfig) -> i
             born: Instant::now(),
             attempts: 0,
         });
+        pool.ensure_capacity();
     }
 }
 
@@ -156,36 +204,55 @@ enum Event {
     Response(Option<Vec<u8>>),
     Work,
     Tick,
+    Idle,
 }
 
-async fn lane(shared: Arc<Shared>, udp: Arc<UdpSocket>, resolver: SocketAddr, depth: usize) {
+enum ServeOutcome {
+    Closed(Option<usize>),
+    Idle,
+}
+
+async fn lane(pool: Arc<LanePool>, persistent: bool) {
     let mut backoff = RECONNECT_MIN;
     loop {
-        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(resolver)).await
-        {
-            Ok(Ok(stream)) => stream,
-            _ => {
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_MAX);
-                continue;
-            }
-        };
+        let stream =
+            match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(pool.resolver)).await {
+                Ok(Ok(stream)) => stream,
+                _ => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                    continue;
+                }
+            };
         backoff = RECONNECT_MIN;
         let _ = stream.set_nodelay(true);
         let (reader, writer) = stream.into_split();
-        let (tx, rx) = mpsc::channel(depth + 4);
+        let (tx, rx) = mpsc::channel(pool.depth + 4);
         let reader_task = tokio::spawn(read_frames(reader, tx));
-        let mut pending = HashMap::with_capacity(depth);
-        let answered = serve(&shared, &udp, writer, rx, depth, &mut pending).await;
+        let mut pending = HashMap::with_capacity(pool.depth);
+        let outcome = serve(
+            &pool.shared,
+            &pool.udp,
+            writer,
+            rx,
+            pool.depth,
+            &mut pending,
+            persistent,
+        )
+        .await;
         reader_task.abort();
         // A resolver closing a connection that was answering (normal churn) is not
         // the query's fault; only silent or dead connections consume an attempt.
+        let answered = match outcome {
+            ServeOutcome::Idle => return,
+            ServeOutcome::Closed(answered) => answered,
+        };
         let charge = u8::from(answered.is_none());
         let now = Instant::now();
         for (_, (mut query, _)) in pending.drain() {
             query.attempts += charge;
             if query.attempts < MAX_ATTEMPTS && query.fresh(now) {
-                shared.push_front(query);
+                pool.shared.push_front(query);
             }
         }
     }
@@ -201,7 +268,8 @@ async fn serve(
     mut rx: mpsc::Receiver<Vec<u8>>,
     depth: usize,
     pending: &mut HashMap<u16, (Query, Instant)>,
-) -> Option<usize> {
+    persistent: bool,
+) -> ServeOutcome {
     let mut frame = Vec::with_capacity(MAX_DNS_MESSAGE + 2);
     let mut answers = 0usize;
     loop {
@@ -213,7 +281,7 @@ async fn serve(
             let id = query.id();
             if writer.write_all(&frame).await.is_err() {
                 pending.insert(id, (query, Instant::now()));
-                return (answers > 0).then_some(answers);
+                return ServeOutcome::Closed((answers > 0).then_some(answers));
             }
             // A duplicate ID on this lane keeps only the newest exchange.
             pending.insert(id, (query, Instant::now()));
@@ -225,7 +293,21 @@ async fn serve(
                 None => std::future::pending::<()>().await,
             }
         };
-        let event = if pending.len() < depth {
+        let idle = async {
+            if persistent {
+                std::future::pending::<()>().await
+            } else {
+                tokio::time::sleep(LANE_IDLE).await
+            }
+        };
+        let event = if pending.is_empty() && !persistent {
+            tokio::select! {
+                biased;
+                response = rx.recv() => Event::Response(response),
+                _ = shared.notify.notified() => Event::Work,
+                _ = idle => Event::Idle,
+            }
+        } else if pending.len() < depth {
             tokio::select! {
                 biased;
                 response = rx.recv() => Event::Response(response),
@@ -240,8 +322,9 @@ async fn serve(
             }
         };
         match event {
-            Event::Response(None) => return (answers > 0).then_some(answers),
-            Event::Tick => return None,
+            Event::Response(None) => return ServeOutcome::Closed((answers > 0).then_some(answers)),
+            Event::Tick => return ServeOutcome::Closed(None),
+            Event::Idle => return ServeOutcome::Idle,
             Event::Work => {}
             Event::Response(Some(response)) => {
                 if response[2] & 0x80 == 0 {

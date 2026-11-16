@@ -12,6 +12,7 @@ struct ServerArgs : MainArguments<ServerArgs> {
     bool listen_ipv6 = option("dns-listen-ipv6", '6', "DNS listen on IPv6 (default: false)") = false;
     std::string listen_host = option("dns-listen-host", '\0', "DNS listen IPv4 address (default: wildcard)") = "";
     std::string reset_seed = option("reset-seed", '\0', "Existing reset seed file (32 hex characters)") = "";
+    std::string token_file = option("token-file", '\0', "16-byte FlowRelay token file enabling DNS payload obfuscation") = "";
     std::string target_address = option("target-address", 'a', "Target server address (default: 127.0.0.1:5201)") = "127.0.0.1:5201";    std::string cert = option("cert", 'c', "Certificate file path (default: certs/cert.pem)") = "certs/cert.pem";
     std::string key = option("key", 'k', "Private key file path (default: certs/key.pem)") = "certs/key.pem";
     std::vector<std::string> domain = option("domain", 'd', "Authoritative suffix (repeatable, required)");
@@ -89,7 +90,8 @@ int main(int argc, char** argv) {
         domains.data(), domains.size(), args.max_connections, args.idle_timeout,
         args.listen_host.empty() ? nullptr : args.listen_host.c_str(),
         args.reset_seed.empty() ? nullptr : args.reset_seed.c_str(),
-        (size_t)args.mtu
+        (size_t)args.mtu,
+        args.token_file.empty() ? nullptr : args.token_file.c_str()
     );
 
 #ifdef _WINDOWS

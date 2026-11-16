@@ -2,7 +2,17 @@
 #include "../src/slipstream_server.c"
 #include <assert.h>
 
-static void empty_response(const char *name, dns_type_t type, dns_rcode_t expected) {
+static dns_query_t *decode_answer(unsigned char *response, size_t length,
+    dns_decoded_t *buffer, size_t *size) {
+    *size = DNS_DECODEBUF_4K;
+    assert(dns_decode(buffer, size, (dns_packet_t *)response, length) == RCODE_OKAY);
+    return (dns_query_t *)buffer;
+}
+
+/* Out-of-zone, apex, non-TXT and malformed-payload queries are answered
+ * directly from the zone code without creating a QUIC response. */
+static void direct_reply(const char *name, dns_type_t type, dns_rcode_t expected,
+    size_t expect_ns) {
     slot_t slot = {0};
     dns_question_t question = {0};
     question.name = (char *)name; question.type = type; question.class = CLASS_IN;
@@ -16,26 +26,56 @@ static void empty_response(const char *name, dns_type_t type, dns_rcode_t expect
     peer.ss_family = AF_INET; local.ss_family = AF_INET;
     unsigned char *decoded = NULL;
     ssize_t length = server_decode(&slot, NULL, &decoded, packet, size, &peer, &local);
-    assert(length == (expected == RCODE_OKAY ? 1 : 0));
-    assert(slot.error == expected);
-    free(decoded);
+    assert(length == 0 && decoded == NULL);
+    assert(slot.direct && slot.direct_len);
 
-    unsigned char *response = NULL;
-    length = server_encode(&slot, NULL, &response, NULL, 0, NULL, &peer, &local);
-    assert(length > 0 && response);
     dns_decoded_t buffer[DNS_DECODEBUF_4K];
-    size = sizeof(buffer);
-    assert(dns_decode(buffer, &size, (dns_packet_t *)response, (size_t)length) == RCODE_OKAY);
-    dns_query_t *answer = (dns_query_t *)buffer;
+    dns_query_t *answer = decode_answer(slot.direct, slot.direct_len, buffer, &size);
     assert(!answer->query && answer->aa && answer->rd && answer->cd);
     assert(answer->id == query.id && answer->rcode == expected);
     assert(answer->qdcount == 1 && answer->ancount == 0);
+    assert(answer->nscount == expect_ns);
+    assert(answer->arcount == 0);
     assert(!strcmp(answer->questions[0].name, name));
     assert(answer->questions[0].type == type);
-    assert(answer->arcount == 1 && answer->additional[0].opt.type == RR_OPT);
-    assert(answer->additional[0].opt.udp_payload == 1232);
-    assert(!memcmp(&peer, &slot.peer_addr, sizeof(peer)));
-    assert(!memcmp(&local, &slot.local_addr, sizeof(local)));
+    free(slot.direct);
+}
+
+/* A valid TXT payload under the zone keeps the original tunnel path: the server
+ * hands the decoded bytes to QUIC and encodes the TXT reply itself. */
+static void tunnel_payload(const char *name) {
+    slot_t slot = {0};
+    dns_question_t question = {0};
+    question.name = (char *)name; question.type = RR_TXT; question.class = CLASS_IN;
+    dns_query_t query = {0};
+    query.id = 0x1234; query.query = true; query.rd = true; query.cd = true;
+    query.qdcount = 1; query.questions = &question;
+    unsigned char packet[MAX_UDP_PACKET_SIZE];
+    size_t size = sizeof(packet);
+    assert(dns_encode((dns_packet_t *)packet, &size, &query) == RCODE_OKAY);
+    struct sockaddr_storage peer = {0}, local = {0};
+    peer.ss_family = AF_INET; local.ss_family = AF_INET;
+    unsigned char *decoded = NULL;
+    ssize_t length = server_decode(&slot, NULL, &decoded, packet, size, &peer, &local);
+    assert(length == 1 && decoded);
+    assert(!slot.direct);
+    assert(slot.error == RCODE_OKAY);
+
+    unsigned char *response = NULL;
+    ssize_t answer_len = server_encode(&slot, NULL, &response, decoded, (size_t)length,
+        NULL, &peer, &local);
+    assert(answer_len > 0 && response);
+    free(decoded);
+
+    dns_decoded_t buffer[DNS_DECODEBUF_4K];
+    dns_query_t *answer = decode_answer(response, (size_t)answer_len, buffer, &size);
+    assert(!answer->query && answer->aa && answer->rd && answer->cd);
+    assert(answer->id == query.id && answer->rcode == RCODE_OKAY);
+    assert(answer->qdcount == 1 && answer->ancount == 1 && answer->nscount == 0);
+    assert(answer->answers[0].txt.type == RR_TXT);
+    assert(answer->answers[0].txt.ttl >= 30 && answer->answers[0].txt.ttl <= 270);
+    /* The query had no EDNS OPT, so the reply must not invent one. */
+    assert(answer->arcount == 0);
     free(response);
 }
 
@@ -63,6 +103,7 @@ static void reply_fits(size_t labels_len, int edns) {
     unsigned char *decoded = NULL;
     (void)server_decode(&slot, NULL, &decoded, packet, size, &peer, &local);
     free(decoded);
+    free(slot.direct);
     assert(slot.max_quic > 0);
     unsigned char payload[MAX_UDP_PACKET_SIZE];
     memset(payload, 0x5a, sizeof(payload));
@@ -80,14 +121,15 @@ static void reply_fits(size_t labels_len, int edns) {
 int main(void) {
     const char *domains[] = {"t.test"};
     server_domains = domains; server_domain_count = 1;
-    empty_response("aa.t.test.", RR_TXT, RCODE_OKAY);
-    empty_response("aa.untrusted.test.", RR_TXT, RCODE_NAME_ERROR);
-    empty_response("aa.t.test.", RR_A, RCODE_NAME_ERROR);
-    empty_response("00.t.test.", RR_TXT, RCODE_NAME_ERROR);
+    direct_reply("aa.untrusted.test.", RR_TXT, RCODE_REFUSED, 0);
+    direct_reply("aa.t.test.", RR_A, RCODE_NAME_ERROR, 1);
+    direct_reply("00.t.test.", RR_TXT, RCODE_NAME_ERROR, 1);
+    direct_reply("t.test.", RR_TXT, RCODE_OKAY, 1);
+    tunnel_payload("aa.t.test.");
     reply_fits(240, 1232);
-    reply_fits(60, 1232);
+    reply_fits(64, 1232);
     reply_fits(240, 4096);
-    reply_fits(60, 4096);
-    reply_fits(60, 0);
+    reply_fits(64, 4096);
+    reply_fits(64, 0);
     return 0;
 }

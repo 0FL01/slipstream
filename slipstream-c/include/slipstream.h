@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define SLIPSTREAM_ALPN "picoquic_sample"
+#define SLIPSTREAM_ALPN "h3"
 #define SLIPSTREAM_SNI "test.example.com"
 
 #define SLIPSTREAM_NO_ERROR 0
@@ -32,7 +32,8 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
 int picoquic_slipstream_server(int server_port, bool listen_ipv6, const char* pem_cert, const char* pem_key,
                                struct sockaddr_storage* target_address, const char* const* domains,
                                size_t domain_count, size_t max_connections, size_t idle_timeout,
-                               const char* listen_host, const char* reset_seed_file, size_t mtu);
+                               const char* listen_host, const char* reset_seed_file, size_t mtu,
+                               const char* token_file);
 
 #ifdef __cplusplus
 }

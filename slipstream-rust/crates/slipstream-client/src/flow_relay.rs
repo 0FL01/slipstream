@@ -46,6 +46,12 @@ pub(crate) fn read_bootstrap(mut input: impl Read) -> Result<FlowRelayConfig, St
     })
 }
 
+impl FlowRelayConfig {
+    pub(crate) fn dns_key(&self) -> [u8; 32] {
+        crate::dns::derive_key(&self.token)
+    }
+}
+
 pub(crate) async fn accept_socks<S>(
     stream: &mut S,
     config: &FlowRelayConfig,

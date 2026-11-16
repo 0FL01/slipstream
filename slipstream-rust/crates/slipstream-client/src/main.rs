@@ -213,6 +213,7 @@ fn main() {
         None
     };
 
+    let dns_key = flow_relay.as_ref().map(|relay| relay.dns_key());
     let config = ClientConfig {
         tcp_listen_host: &tcp_listen_host,
         tcp_listen_port,
@@ -223,6 +224,7 @@ fn main() {
         cert: cert.as_deref(),
         keep_alive_interval: keep_alive_interval as usize,
         idle_keep_alive_interval: args.idle_keep_alive_interval as usize,
+        dns_key,
         debug_poll: args.debug_poll,
         debug_streams: args.debug_streams,
     };

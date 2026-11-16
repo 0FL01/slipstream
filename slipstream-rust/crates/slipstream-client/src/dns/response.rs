@@ -7,6 +7,7 @@ use slipstream_ffi::picoquic::{
 use slipstream_ffi::{socket_addr_to_storage, ResolverMode};
 use std::net::SocketAddr;
 
+use super::cipher::DnsCipher;
 use super::resolver::ResolverState;
 use slipstream_core::normalize_dual_stack_addr;
 
@@ -16,6 +17,7 @@ pub(crate) struct DnsResponseContext<'a> {
     pub(crate) quic: *mut picoquic_quic_t,
     pub(crate) local_addr_storage: &'a libc::sockaddr_storage,
     pub(crate) resolvers: &'a mut [ResolverState],
+    pub(crate) cipher: &'a DnsCipher,
 }
 
 pub(crate) fn handle_dns_response(
@@ -26,6 +28,11 @@ pub(crate) fn handle_dns_response(
     let peer = normalize_dual_stack_addr(peer);
     let response_id = dns_response_id(buf);
     if let Some(payload) = decode_response(buf) {
+        // Wrong-key or corrupted replies are ignored exactly like unrelated DNS
+        // traffic; they must not feed QUIC.
+        let Some(payload) = ctx.cipher.decrypt_response(&payload) else {
+            return Ok(());
+        };
         let resolver_index = ctx
             .resolvers
             .iter()

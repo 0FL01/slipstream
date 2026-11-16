@@ -10,6 +10,7 @@ static void feed(const unsigned char *p, size_t n) {
     unsigned char *decoded = NULL;
     (void)server_decode(&slot, NULL, &decoded, p, n, &peer, &local);
     free(decoded);
+    free(slot.direct);
 }
 int main(int argc, char **argv) {
     const char *domains[] = {"t.test"}; server_domains = domains; server_domain_count = 1;

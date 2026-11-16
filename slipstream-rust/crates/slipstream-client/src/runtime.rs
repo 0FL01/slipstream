@@ -9,7 +9,7 @@ use self::setup::{bind_tcp_listener, bind_udp_socket, compute_mtu, map_io};
 use crate::dns::{
     add_paths, expire_inflight_polls, handle_dns_response, maybe_report_debug,
     refresh_resolver_path, resolve_resolvers, resolver_mode_to_c, send_poll_queries,
-    sockaddr_storage_to_socket_addr, DnsResponseContext,
+    sockaddr_storage_to_socket_addr, DnsCipher, DnsResponseContext,
 };
 use crate::error::ClientError;
 use crate::flow_relay::FlowRelayConfig;
@@ -28,10 +28,11 @@ use slipstream_ffi::{
         picoquic_create_client_cnx, picoquic_current_time, picoquic_disable_keep_alive,
         picoquic_enable_keep_alive, picoquic_enable_path_callbacks,
         picoquic_enable_path_callbacks_default, picoquic_get_next_wake_delay,
-        picoquic_prepare_next_packet_ex, picoquic_set_callback, slipstream_has_ready_stream,
-        slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm, slipstream_set_cc_override,
-        slipstream_set_default_path_mode, PICOQUIC_CONNECTION_ID_MAX_SIZE,
-        PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX, PICOQUIC_PACKET_LOOP_SEND_MAX,
+        picoquic_prepare_next_packet_ex, picoquic_set_callback, picoquic_set_default_idle_timeout,
+        slipstream_has_ready_stream, slipstream_is_flow_blocked, slipstream_mixed_cc_algorithm,
+        slipstream_set_cc_override, slipstream_set_default_path_mode,
+        PICOQUIC_CONNECTION_ID_MAX_SIZE, PICOQUIC_MAX_PACKET_SIZE, PICOQUIC_PACKET_LOOP_RECV_MAX,
+        PICOQUIC_PACKET_LOOP_SEND_MAX,
     },
     socket_addr_to_storage, take_crypto_errors, ClientConfig, QuicGuard, ResolverMode,
 };
@@ -44,7 +45,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 // Protocol defaults; see docs/config.md for details.
-const SLIPSTREAM_ALPN: &str = "picoquic_sample";
+const SLIPSTREAM_ALPN: &str = "h3";
 const SLIPSTREAM_SNI: &str = "test.example.com";
 const DNS_WAKE_DELAY_MAX_US: i64 = 10_000_000;
 const DNS_POLL_SLICE_US: u64 = 50_000;
@@ -52,6 +53,13 @@ const BUSY_WINDOW_US: u64 = 400_000;
 const WARM_WINDOW_US: u64 = 1_000_000;
 const WARM_POLL_INTERVAL_US: u64 = 400_000;
 const QUIESCENT_POLL_INTERVAL_US: u64 = 2_000_000;
+const QUIESCENT_MEDIUM_POLL_INTERVAL_US: u64 = 5_000_000;
+const QUIESCENT_SLOW_POLL_INTERVAL_US: u64 = 20_000_000;
+const IDLE_MEDIUM_AFTER_US: u64 = 60_000_000;
+const IDLE_SLOW_AFTER_US: u64 = 120_000_000;
+const IDLE_MEDIUM_KEEPALIVE_MS: usize = 15_000;
+const IDLE_SLOW_KEEPALIVE_MS: usize = 60_000;
+const QUIC_IDLE_TIMEOUT_MS: u64 = 180_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SchedulerPhase {
@@ -63,9 +71,15 @@ enum SchedulerPhase {
 }
 
 impl SchedulerPhase {
-    fn poll_interval_us(self) -> Option<u64> {
+    fn poll_interval_us(self, idle_for_us: u64) -> Option<u64> {
         match self {
             Self::Warm => Some(WARM_POLL_INTERVAL_US),
+            Self::QuiescentOpen if idle_for_us >= IDLE_SLOW_AFTER_US => {
+                Some(QUIESCENT_SLOW_POLL_INTERVAL_US)
+            }
+            Self::QuiescentOpen if idle_for_us >= IDLE_MEDIUM_AFTER_US => {
+                Some(QUIESCENT_MEDIUM_POLL_INTERVAL_US)
+            }
             Self::QuiescentOpen => Some(QUIESCENT_POLL_INTERVAL_US),
             _ => None,
         }
@@ -92,11 +106,21 @@ fn scheduler_phase(
     }
 }
 
-fn keep_alive_interval(phase: SchedulerPhase, active: usize, idle: usize) -> usize {
-    if phase == SchedulerPhase::Busy {
-        active
-    } else {
-        idle
+fn keep_alive_interval(
+    phase: SchedulerPhase,
+    active: usize,
+    idle: usize,
+    idle_for_us: u64,
+) -> usize {
+    match phase {
+        SchedulerPhase::Busy => active,
+        SchedulerPhase::QuiescentOpen if idle_for_us >= IDLE_SLOW_AFTER_US => {
+            IDLE_SLOW_KEEPALIVE_MS
+        }
+        SchedulerPhase::QuiescentOpen if idle_for_us >= IDLE_MEDIUM_AFTER_US => {
+            IDLE_MEDIUM_KEEPALIVE_MS
+        }
+        _ => idle,
     }
 }
 
@@ -119,6 +143,8 @@ fn authoritative_poll_budget(
 struct ActivityScheduler {
     phase: SchedulerPhase,
     next_sparse_poll_at: u64,
+    poll_interval_us: u64,
+    jitter_state: u64,
 }
 
 impl ActivityScheduler {
@@ -137,6 +163,8 @@ impl ActivityScheduler {
             has_ready_stream,
             flow_blocked,
         );
+        let idle_for_us = now.saturating_sub(last_activity_at);
+        self.poll_interval_us = next.poll_interval_us(idle_for_us).unwrap_or(0);
         if next != self.phase {
             if next == SchedulerPhase::Warm
                 || (next == SchedulerPhase::QuiescentOpen && self.phase != SchedulerPhase::Warm)
@@ -151,15 +179,32 @@ impl ActivityScheduler {
     }
 
     fn sparse_poll_due(&self, now: u64) -> bool {
-        self.phase.poll_interval_us().is_some() && now >= self.next_sparse_poll_at
+        self.poll_interval_us > 0 && now >= self.next_sparse_poll_at
     }
 
     fn record_sparse_poll(&mut self, now: u64, sent: bool) {
-        let Some(interval) = self.phase.poll_interval_us() else {
+        if self.poll_interval_us == 0 {
             return;
+        }
+        let interval = if sent {
+            self.jittered(self.poll_interval_us)
+        } else {
+            DNS_POLL_SLICE_US
         };
-        self.next_sparse_poll_at =
-            now.saturating_add(if sent { interval } else { DNS_POLL_SLICE_US });
+        self.next_sparse_poll_at = now.saturating_add(interval);
+    }
+
+    /// +/-10% spread so idle polls do not form a fixed-period beacon.
+    fn jittered(&mut self, value: u64) -> u64 {
+        if self.jitter_state == 0 {
+            self.jitter_state = 0x9e37_79b9_7f4a_7c15;
+        }
+        self.jitter_state ^= self.jitter_state << 13;
+        self.jitter_state ^= self.jitter_state >> 7;
+        self.jitter_state ^= self.jitter_state << 17;
+        let span = (value / 10).max(1);
+        let delta = self.jitter_state % (2 * span + 1);
+        value.saturating_sub(span).saturating_add(delta).max(1)
     }
 
     fn timeout_us(
@@ -220,7 +265,8 @@ pub async fn run_client(
     flow_relay: Option<Arc<FlowRelayConfig>>,
 ) -> Result<i32, ClientError> {
     let domain_len = config.domain.len();
-    let mtu = compute_mtu(domain_len)?;
+    let mut cipher = DnsCipher::new(config.dns_key);
+    let mtu = compute_mtu(domain_len)?.saturating_sub(cipher.overhead() as u32);
     let udp = bind_udp_socket().await?;
 
     let (command_tx, mut command_rx) = mpsc::unbounded_channel();
@@ -332,6 +378,7 @@ pub async fn run_client(
         }
         unsafe {
             configure_quic_with_custom(quic, mixed_cc, mtu);
+            picoquic_set_default_idle_timeout(quic, QUIC_IDLE_TIMEOUT_MS);
             picoquic_enable_path_callbacks_default(quic, 1);
             let override_ptr = cc_override
                 .as_ref()
@@ -449,10 +496,12 @@ pub async fn run_client(
                 phase,
                 config.keep_alive_interval,
                 config.idle_keep_alive_interval,
+                current_time.saturating_sub(last_activity_at),
             );
             if desired_keep_alive != current_keep_alive {
+                let jittered = scheduler.jittered(desired_keep_alive as u64) as usize;
                 unsafe {
-                    set_keep_alive(cnx, desired_keep_alive);
+                    set_keep_alive(cnx, jittered);
                 }
                 current_keep_alive = desired_keep_alive;
             }
@@ -516,6 +565,7 @@ pub async fn run_client(
                                 quic,
                                 local_addr_storage: &local_addr_storage,
                                 resolvers: &mut resolvers,
+                                cipher: &cipher,
                             };
                             handle_dns_response(&recv_buf[..size], peer, &mut response_ctx)?;
                             for _ in 1..packet_loop_recv_max {
@@ -608,7 +658,8 @@ pub async fn run_client(
                     }
                 }
 
-                let qname = build_qname(&send_buf[..send_length], config.domain)
+                let encrypted = cipher.encrypt_query(&send_buf[..send_length]);
+                let qname = build_qname(&encrypted, config.domain)
                     .map_err(|err| ClientError::new(err.to_string()))?;
                 let params = QueryParams {
                     id: dns_id,
@@ -722,9 +773,10 @@ pub async fn run_client(
                                 resolver,
                                 &mut to_send,
                                 &mut send_buf,
+                                &mut cipher,
                             )
                             .await?;
-                            if phase.poll_interval_us().is_some() {
+                            if scheduler.poll_interval_us > 0 {
                                 scheduler.record_sparse_poll(now, to_send == 0);
                             }
                         }
@@ -744,6 +796,7 @@ pub async fn run_client(
                                     resolver,
                                     &mut to_send,
                                     &mut send_buf,
+                                    &mut cipher,
                                 )
                                 .await?;
                                 resolver.pending_polls = resolver
@@ -761,6 +814,7 @@ pub async fn run_client(
                                     resolver,
                                     &mut pending,
                                     &mut send_buf,
+                                    &mut cipher,
                                 )
                                 .await?;
                                 resolver.pending_polls = pending;
@@ -873,13 +927,27 @@ mod adaptive_idle_tests {
 
     #[test]
     fn selects_keep_alive_and_poll_budgets() {
-        assert_eq!(keep_alive_interval(SchedulerPhase::Busy, 400, 5000), 400);
-        assert_eq!(keep_alive_interval(SchedulerPhase::Warm, 400, 5000), 5000);
+        assert_eq!(keep_alive_interval(SchedulerPhase::Busy, 400, 5000, 0), 400);
         assert_eq!(
-            keep_alive_interval(SchedulerPhase::QuiescentOpen, 400, 5000),
+            keep_alive_interval(SchedulerPhase::Warm, 400, 5000, 0),
             5000
         );
-        assert_eq!(keep_alive_interval(SchedulerPhase::Empty, 400, 5000), 5000);
+        assert_eq!(
+            keep_alive_interval(SchedulerPhase::QuiescentOpen, 400, 5000, 0),
+            5000
+        );
+        assert_eq!(
+            keep_alive_interval(SchedulerPhase::QuiescentOpen, 400, 5000, 60_000_000),
+            15_000
+        );
+        assert_eq!(
+            keep_alive_interval(SchedulerPhase::QuiescentOpen, 400, 5000, 120_000_000),
+            60_000
+        );
+        assert_eq!(
+            keep_alive_interval(SchedulerPhase::Empty, 400, 5000, 0),
+            5000
+        );
         assert_eq!(
             authoritative_poll_budget(SchedulerPhase::Busy, 7, false, false, false),
             7
@@ -919,10 +987,8 @@ mod adaptive_idle_tests {
         );
         assert!(scheduler.sparse_poll_due(1_000_000));
         scheduler.record_sparse_poll(1_000_000, true);
-        assert_eq!(
-            scheduler.timeout_us(5_000_000, 1_000_000, 0, false),
-            2_000_000
-        );
+        let interval = scheduler.timeout_us(5_000_000, 1_000_000, 0, false);
+        assert!((1_800_000..=2_200_000).contains(&interval), "{interval}");
         assert_eq!(scheduler.timeout_us(17_000, 1_000_000, 0, false), 17_000);
         scheduler.record_sparse_poll(1_000_000, false);
         assert_eq!(
@@ -947,9 +1013,7 @@ mod adaptive_idle_tests {
             SchedulerPhase::Warm
         );
         scheduler.record_sparse_poll(1_000_000, true);
-        assert_eq!(
-            scheduler.timeout_us(5_000_000, 1_000_000, 500_000, false),
-            400_000
-        );
+        let interval = scheduler.timeout_us(5_000_000, 1_000_000, 500_000, false);
+        assert!((360_000..=440_000).contains(&interval), "{interval}");
     }
 }

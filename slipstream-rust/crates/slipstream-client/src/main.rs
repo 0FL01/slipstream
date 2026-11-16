@@ -161,7 +161,7 @@ fn main() {
                             tracing::error!("SIP003 env error: {}", err);
                             std::process::exit(2);
                         });
-                vec![ResolverSpec { resolver, mode }]
+                vec![ResolverSpec { resolver, mode, upstream: None }]
             } else {
                 tracing::error!("At least one resolver is required");
                 std::process::exit(2);
@@ -298,7 +298,7 @@ fn build_resolvers(
             let local = tcp_bridge::spawn(target, config).map_err(|err| err.to_string())?;
             let resolver = parse_host_port(&local.to_string(), 53, AddressKind::Resolver)
                 .map_err(|err| err.to_string())?;
-            ordered.push((idx, ResolverSpec { resolver, mode: spec.mode }));
+            ordered.push((idx, ResolverSpec { resolver, mode: spec.mode, upstream: Some(spec.resolver) }));
         }
     }
     if ordered.is_empty() && require {
@@ -325,7 +325,7 @@ fn collect_resolvers(
         return Err(format!("Mismatched {} arguments", name));
     }
     for (idx, resolver) in indices.into_iter().zip(values) {
-        ordered.push((idx, ResolverSpec { resolver, mode }));
+        ordered.push((idx, ResolverSpec { resolver, mode, upstream: None }));
     }
     Ok(())
 }
@@ -409,7 +409,7 @@ fn parse_resolvers_from_options(
         for entry in entries {
             let resolver = parse_host_port(&entry, 53, AddressKind::Resolver)
                 .map_err(|err| err.to_string())?;
-            ordered.push(ResolverSpec { resolver, mode });
+            ordered.push(ResolverSpec { resolver, mode, upstream: None });
         }
     }
     Ok(ResolverOptions {

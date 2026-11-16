@@ -20,6 +20,8 @@ pub enum ResolverMode {
 pub struct ResolverSpec {
     pub resolver: HostPort,
     pub mode: ResolverMode,
+    /// Upstream resolver for a local TCP bridge; used only by aggregate stats.
+    pub upstream: Option<HostPort>,
 }
 
 #[derive(Debug)]

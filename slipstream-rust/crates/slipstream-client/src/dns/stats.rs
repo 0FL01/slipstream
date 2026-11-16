@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::resolver::ResolverState;
+
 const REPORT_INTERVAL_US: u64 = 10_000_000;
 
 const RR_A: u16 = 1;
@@ -37,6 +39,7 @@ pub(crate) struct DpiStats {
     resp_le512: u64,
     resp_le1024: u64,
     resp_gt1024: u64,
+    last_paths: Vec<(u64, u64, u64)>,
 }
 
 impl DpiStats {
@@ -67,6 +70,7 @@ impl DpiStats {
             resp_le512: 0,
             resp_le1024: 0,
             resp_gt1024: 0,
+            last_paths: Vec::new(),
         }
     }
 
@@ -135,13 +139,23 @@ impl DpiStats {
         }
     }
 
-    pub(crate) fn maybe_report(&mut self, now: u64) {
+    pub(crate) fn maybe_report(&mut self, now: u64, resolvers: &[ResolverState]) {
         if !self.enabled {
             return;
         }
         if self.last_report_us == 0 {
             self.last_report_us = now;
             self.interval_start_us = now;
+            self.last_paths = resolvers
+                .iter()
+                .map(|resolver| {
+                    (
+                        resolver.debug.send_packets,
+                        resolver.debug.send_bytes,
+                        resolver.debug.dns_responses,
+                    )
+                })
+                .collect();
             return;
         }
         if now.saturating_sub(self.last_report_us) < REPORT_INTERVAL_US {
@@ -220,6 +234,28 @@ impl DpiStats {
             crate::tcp_bridge::active_lanes(),
         );
         eprintln!("{line}");
+        if self.last_paths.len() != resolvers.len() {
+            self.last_paths.resize(resolvers.len(), (0, 0, 0));
+        }
+        for (index, resolver) in resolvers.iter().enumerate() {
+            let last = self.last_paths[index];
+            let send_packets = resolver.debug.send_packets.saturating_sub(last.0);
+            let send_bytes = resolver.debug.send_bytes.saturating_sub(last.1);
+            let dns_responses = resolver.debug.dns_responses.saturating_sub(last.2);
+            eprintln!(
+                "dpi-path: resolver={} qps={:.2} send_bytes+={} send_pkts+={} dns+={}",
+                resolver.stats_label,
+                send_packets as f64 / seconds,
+                send_bytes,
+                send_packets,
+                dns_responses
+            );
+            self.last_paths[index] = (
+                resolver.debug.send_packets,
+                resolver.debug.send_bytes,
+                resolver.debug.dns_responses,
+            );
+        }
         self.last_report_us = now;
         self.interval_start_us = now;
         self.queries = 0;

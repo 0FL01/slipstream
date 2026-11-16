@@ -47,8 +47,10 @@ internal class SlipstreamInstance(
         // Native in-process TCP bridge budget per TCP path. Phone LTE screen 2026-11-14:
         // 112 serial connections per resolver ~1.9x download of 56 at equal latency.
         const val NATIVE_TCP_LANES_PER_PATH = 112
+        const val NATIVE_TCP_LANES_TOTAL = 224
         const val NATIVE_TCP_DEPTH = 1
         const val NATIVE_TCP_QUEUE_PER_PATH = 128
+        const val NATIVE_TCP_QUEUE_TOTAL = 256
         const val QUERY_MAX_AGE_MS = 10_000L
         const val SOCKET_TIMEOUT_MS = 8_000
     }
@@ -205,7 +207,7 @@ internal class SlipstreamInstance(
                 stream.bufferedReader().useLines { lines ->
                     lines.forEach {
                         if (it.contains("Connection ready")) ready.complete(Unit)
-                        if (it.contains("dpi-stats:")) Logs.i("slipstream: $it")
+                        if (it.contains("dpi-stats:") || it.contains("dpi-path:")) Logs.i("slipstream: $it")
                     }
                 }
             }
@@ -309,9 +311,11 @@ internal class SlipstreamInstance(
                     }
                 } + paths.count { it.transport == "tcp" }.let { tcpPaths ->
                     if (tcpPaths == 0) emptyList() else listOf(
-                        "--tcp-lanes", (NATIVE_TCP_LANES_PER_PATH * tcpPaths).toString(),
+                        "--tcp-lanes",
+                        minOf(NATIVE_TCP_LANES_PER_PATH, NATIVE_TCP_LANES_TOTAL / tcpPaths).toString(),
                         "--tcp-depth", NATIVE_TCP_DEPTH.toString(),
-                        "--tcp-queue", (NATIVE_TCP_QUEUE_PER_PATH * tcpPaths).toString(),
+                        "--tcp-queue",
+                        minOf(NATIVE_TCP_QUEUE_PER_PATH, NATIVE_TCP_QUEUE_TOTAL / tcpPaths).toString(),
                     )
                 }
                 startLocked()

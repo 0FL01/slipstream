@@ -436,7 +436,7 @@ pub async fn run_client(
 
         loop {
             let current_time = unsafe { picoquic_current_time() };
-            stats.maybe_report(current_time);
+            stats.maybe_report(current_time, &resolvers);
             drain_commands(cnx, state_ptr, &mut command_rx);
             drain_stream_data(cnx, state_ptr);
             let closing = unsafe { (*state_ptr).is_closing() };

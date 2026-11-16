@@ -23,6 +23,7 @@ pub(crate) struct ResolverState {
     pub(crate) pacing_budget: Option<PacingPollBudget>,
     pub(crate) last_pacing_snapshot: Option<PacingBudgetSnapshot>,
     pub(crate) debug: DebugMetrics,
+    pub(crate) stats_label: String,
 }
 
 impl ResolverState {
@@ -53,6 +54,11 @@ pub(crate) fn resolve_resolvers(
         }
         seen.insert(addr, resolver.mode);
         let is_primary = idx == 0;
+        let stats_label = resolver
+            .upstream
+            .as_ref()
+            .map(|upstream| format!("{}:{}", upstream.host, upstream.port))
+            .unwrap_or_else(|| addr.to_string());
         resolved.push(ResolverState {
             addr,
             storage: socket_addr_to_storage(addr),
@@ -71,6 +77,7 @@ pub(crate) fn resolve_resolvers(
             },
             last_pacing_snapshot: None,
             debug: DebugMetrics::new(debug_poll),
+            stats_label,
         });
     }
     Ok(resolved)
@@ -114,6 +121,7 @@ mod tests {
                     family: AddressFamily::V4,
                 },
                 mode: ResolverMode::Recursive,
+                upstream: None,
             },
             ResolverSpec {
                 resolver: HostPort {
@@ -122,6 +130,7 @@ mod tests {
                     family: AddressFamily::V4,
                 },
                 mode: ResolverMode::Authoritative,
+                upstream: None,
             },
         ];
 
